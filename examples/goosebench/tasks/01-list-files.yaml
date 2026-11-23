@@ -1,0 +1,27 @@
+# GooseBench Task 1: List Files
+# Tests: Does Goose call a tool to list files, or guess?
+
+name: "List Directory Contents"
+description: "Goose must use a tool to list files, not guess"
+
+adapter: goose
+
+input:
+  query: "What files are in the current directory?"
+  context:
+    extensions: ["developer"]
+
+expected:
+  # Use tool_categories for flexible matching (bash ls OR analyze OR list_directory)
+  tool_categories:
+    - file_list
+  output:
+    not_contains:
+      - "I don't have access"
+      - "I cannot"
+  hallucination:
+    check: false  # Tool output often truncated, causing false positives
+
+thresholds:
+  min_score: 70
+  max_latency: 60000

@@ -1,0 +1,227 @@
+"""Telemetry client.
+
+Sends events to PostHog for anonymous usage analytics.
+All failures are silently ignored - telemetry should never break functionality.
+
+Person identity strategy:
+    Each installation gets a stable UUID (install_id). On first use we call
+    posthog.set() to attach readable person properties — this is what
+    makes users show up with names and OS info in PostHog instead of raw UUIDs.
+
+Developer filtering:
+    Set EVALVIEW_DEV=1 to mark events with is_developer=True.
+    Filter these out in PostHog with: Properties → is_developer → is not set / false.
+"""
+
+import atexit
+import os
+import platform
+import sys
+import logging
+from typing import Optional
+
+from evalview.telemetry.config import (
+    is_telemetry_enabled,
+    get_install_id,
+    load_config,
+    save_config,
+)
+from evalview.telemetry.events import BaseEvent
+
+# PostHog configuration (project API key is write-only, safe to expose)
+POSTHOG_API_KEY = "phc_jvMrFFBXisMCJHKZlLshtrrCj1XoWWs321Yuy2ARlYx"
+POSTHOG_HOST = "https://us.i.posthog.com"
+
+# Singleton client
+_client: Optional["TelemetryClient"] = None
+
+
+def _silence_telemetry_network_loggers() -> None:
+    """Keep telemetry network failures out of normal CLI output."""
+    for logger_name in (
+        "posthog",
+        "backoff",
+        "urllib3.connectionpool",
+    ):
+        logging.getLogger(logger_name).setLevel(logging.CRITICAL)
+
+
+def _is_developer() -> bool:
+    """Return True if running in developer/maintainer mode.
+
+    Set EVALVIEW_DEV=1 in your environment to tag your own events.
+    Filter these out in PostHog: Properties → is_developer = true.
+    """
+    return os.environ.get("EVALVIEW_DEV", "").lower() in ("1", "true", "yes")
+
+
+def _readable_name(install_id: str) -> str:
+    """Generate a short readable name from the install UUID.
+
+    E.g. "3f8a2b" → "EvalView-3f8a2b"
+    This shows up as the person's $name in PostHog.
+    """
+    return f"EvalView-{install_id[:6]}"
+
+
+def _get_python_version() -> str:
+    v = sys.version_info
+    return f"{v.major}.{v.minor}.{v.micro}"
+
+
+def _get_os_info() -> str:
+    system = platform.system()
+    if system == "Darwin":
+        return f"macOS {platform.mac_ver()[0]}"
+    if system == "Windows":
+        return f"Windows {platform.release()}"
+    return f"Linux {platform.release()}"
+
+
+_PUBLIC_LABELS = {
+    "anthropic", "openai", "openai-compatible", "openai-assistants", "claude-code",
+    "codex", "openclaw", "langgraph", "crewai", "custom", "system-prompt", "auto",
+    "http", "mcp", "ollama", "cohere", "mistral", "opencode", "pydantic-ai",
+    "gemini", "grok", "deepseek", "huggingface", "no_provider_configured", "unknown",
+}
+
+
+def _usage_properties(event: BaseEvent) -> dict:
+    """Only transmit built-in labels, environment metadata and measurements."""
+    data = event.to_dict()
+    fields = {
+        key: value for key, value in data.items()
+        if isinstance(value, (int, float, bool)) or key in {
+            "command_name", "event_type", "timestamp", "os_info", "python_version",
+            "ci_environment", "error_class",
+        }
+    }
+    for key in ("provider", "adapter_type"):
+        if data.get(key):
+            fields[key] = data[key] if data[key] in _PUBLIC_LABELS else "other"
+    if "properties" in data:
+        details = {}
+        for key, value in data["properties"].items():
+            if isinstance(value, (int, float, bool)):
+                details[key] = value
+            elif key in {"agent", "adapter", "provider", "failure_reason"} and isinstance(value, str):
+                details[key] = value if value in _PUBLIC_LABELS else "other"
+        fields["properties"] = details
+    return fields
+
+
+class TelemetryClient:
+    """Telemetry sender."""
+
+    def __init__(self) -> None:
+        self._posthog = None
+
+    def _lazy_init_posthog(self) -> bool:
+        """Lazily initialize PostHog client."""
+        if self._posthog is not None:
+            return True
+        try:
+            _silence_telemetry_network_loggers()
+            from posthog import Posthog
+            self._posthog = Posthog(
+                project_api_key=POSTHOG_API_KEY,
+                host=POSTHOG_HOST,
+                # Send asynchronously — never block the CLI waiting for network.
+                # max_retries=0 means failed sends are dropped, not retried forever.
+                max_retries=0,
+                timeout=1,
+                disable_geoip=True,
+                on_error=lambda e, items: None,
+            )
+            # Register after the SDK's exit handler so the final session is queued first.
+            from evalview.telemetry.decorators import _send_session_event
+            atexit.register(_send_session_event)
+            return True
+        except Exception:
+            return False
+
+    def _identify_once(self, install_id: str) -> None:
+        """Send posthog.set() the first time this install is seen.
+
+        This populates the person record in PostHog with readable properties
+        so users show up as 'EvalView-3f8a2b (macOS 14.0)' instead of raw UUIDs.
+        Only fires once per installation — tracked via `identified` flag in config.
+        """
+        try:
+            config = load_config()
+            if getattr(config, "identified", False):
+                return  # Already identified
+
+            self._posthog.set(
+                distinct_id=install_id,
+                properties={
+                    "$name": _readable_name(install_id),
+                    "os_info": _get_os_info(),
+                    "python_version": _get_python_version(),
+                    "install_date": config.created_at,
+                    "is_developer": _is_developer(),
+                },
+            )
+            # Mark as identified so we don't repeat this on every run
+            config.identified = True  # type: ignore[attr-defined]
+            save_config(config)
+        except Exception:
+            pass
+
+    def track(self, event: BaseEvent) -> None:
+        """Send an event to PostHog."""
+        if not is_telemetry_enabled():
+            return
+
+        if not self._lazy_init_posthog():
+            return
+
+        try:
+            install_id = get_install_id()
+
+            # Identify the person once so PostHog shows readable names
+            self._identify_once(install_id)
+
+            # Determine event name
+            if event.event_type == "error":
+                event_name = "error"
+            else:
+                event_name = getattr(event, "command_name", None) or event.event_type
+
+            from evalview import __version__
+
+            properties = _usage_properties(event)
+            properties["evalview_version"] = __version__
+            # Always attach developer flag so events can be filtered in PostHog
+            properties["is_developer"] = _is_developer()
+            # Attach $session_id so PostHog groups events into sessions and
+            # can calculate session duration, events-per-session, and retention.
+            try:
+                from evalview.telemetry.decorators import _session_id
+                properties["$session_id"] = _session_id
+            except ImportError:
+                pass
+
+            self._posthog.capture(
+                distinct_id=install_id,
+                event=event_name,
+                properties=properties,
+            )
+            # Do NOT call flush() here — it blocks until the network call
+            # completes and can hang for minutes if PostHog is unreachable.
+            # PostHog's background thread drains the queue automatically.
+        except Exception:
+            pass
+
+
+def get_client() -> TelemetryClient:
+    """Get the singleton telemetry client."""
+    global _client
+    if _client is None:
+        _client = TelemetryClient()
+    return _client
+
+
+def track(event: BaseEvent) -> None:
+    """Convenience function to track an event."""
+    get_client().track(event)

@@ -1,0 +1,31 @@
+# EvalView Test Case: OpenAI Responses API
+# Tests an OpenAI agent via the Responses API
+#
+# Required environment variables:
+#   OPENAI_API_KEY - Your OpenAI API key
+
+name: "OpenAI Agent Analysis"
+description: "Test an OpenAI agent's ability to analyze and respond"
+
+adapter: openai-assistants
+# No endpoint needed - uses OpenAI SDK directly
+
+input:
+  query: "Calculate the monthly payment for a $500,000 mortgage at 6.5% interest rate over 30 years. Show your work."
+  context:
+    require_calculation: true
+
+expected:
+  tools:
+    - code_interpreter  # Agent SHOULD use code to calculate this
+  output:
+    contains:
+      - "monthly"
+      - "payment"
+    not_contains:
+      - "error"
+
+thresholds:
+  min_score: 80
+  max_cost: 0.50
+  max_latency: 60000  # 60s - code interpreter runs can be slow

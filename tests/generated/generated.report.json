@@ -1,0 +1,104 @@
+{
+  "report_version": 1,
+  "generated_at": "2026-03-18T14:16:42.151947+00:00",
+  "probes_run": 4,
+  "tests_generated": 3,
+  "discovery": {
+    "count": 2,
+    "tools": [
+      {
+        "name": "health_health_get",
+        "description": "Health"
+      },
+      {
+        "name": "execute_execute_post",
+        "description": "Execute"
+      }
+    ]
+  },
+  "prompt_sources": {
+    "llm_synthesized:happy_path": 1,
+    "llm_synthesized:multi_step": 1,
+    "llm_synthesized:ambiguous": 1
+  },
+  "behavior_signatures": {
+    "clarification": 3,
+    "tool_path:lookup_order->check_refund_policy->issue_refund": 1,
+    "multi_turn:lookup_order->check_refund_policy->issue_refund": 1,
+    "tool_path:check_service_status": 1
+  },
+  "covered": {
+    "tool_paths": 1,
+    "direct_answers": 0,
+    "clarifications": 1,
+    "multi_turn": 1,
+    "refusals": 0,
+    "error_paths": 0
+  },
+  "tools_seen": {
+    "lookup_order": 1,
+    "check_refund_policy": 1,
+    "issue_refund": 1,
+    "check_service_status": 1
+  },
+  "failures": [],
+  "draft_tests": [
+    {
+      "name": "Refund order 84731 blender arrived yesterday - multi-turn",
+      "query": "I need a refund for order #84731. The blender arrived yesterday with a cracked jar and won't turn on. Please tell me if I'm eligible and help me get the refund started.",
+      "signature": "multi_turn:lookup_order->check_refund_policy->issue_refund",
+      "rationale": "Turn 1: Thanks\u2014how long will it take for the refund to show up on my \u2192 Turn 2: What if it still hasn\u2019t shown up after 5 business days?",
+      "prompt_source": "llm_synthesized:happy_path"
+    },
+    {
+      "name": "Why was charged march subscription thought - clarification",
+      "query": "Why was I charged $79.99 on March 1 for my subscription? I thought I was on the $49.99 plan and I canceled in February. Please review the billing issue and explain what happened.",
+      "signature": "clarification",
+      "rationale": "Observed clarification path",
+      "prompt_source": "llm_synthesized:multi_step"
+    },
+    {
+      "name": "Log account right now whole team",
+      "query": "I can't log into my account right now and my whole team is seeing error messages. Is there a service outage, or is this just affecting our account?",
+      "signature": "tool_path:check_service_status",
+      "rationale": "Observed tool path: check_service_status",
+      "prompt_source": "llm_synthesized:ambiguous"
+    }
+  ],
+  "gaps": [
+    "Discovered but not exercised: health_health_get",
+    "No refusal or safety path observed.",
+    "No error-path behavior observed."
+  ],
+  "prompt_synthesis": {
+    "count": 3
+  },
+  "changes_since_last_generation": {
+    "new_signatures": [
+      "multi_turn:lookup_order->check_refund_policy->issue_refund",
+      "tool_path:check_service_status",
+      "tool_path:lookup_order->check_refund_policy->issue_refund"
+    ],
+    "resolved_signatures": [
+      "multi_turn:search_pain_history->search_pain_history->get_collection_results",
+      "tool_path:get_collection_results",
+      "tool_path:get_collection_results->search_pain_history->search_pain_history->get_collection_results",
+      "tool_path:search_pain_history->get_collection_results->search_pain_history",
+      "tool_path:search_pain_history->search_pain_history->get_collection_results"
+    ],
+    "new_tools": [
+      "check_refund_policy",
+      "check_service_status",
+      "issue_refund",
+      "lookup_order"
+    ],
+    "resolved_gaps": [
+      "Discovered but not exercised: invoke_invoke_post, health_health_get",
+      "No clarification path observed."
+    ],
+    "new_gaps": [
+      "Discovered but not exercised: health_health_get"
+    ],
+    "tests_generated_delta": 0
+  }
+}

@@ -1,0 +1,1142 @@
+"""Display and printing functions for check command output."""
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+
+from evalview.commands.shared import console
+
+if TYPE_CHECKING:
+    from evalview.core.types import EvaluationResult
+    from evalview.core.diff import TraceDiff, ToolDiff
+    from evalview.core.project_state import ProjectState
+    from evalview.core.drift_tracker import DriftTracker
+    from evalview.core.golden import GoldenTrace
+    from evalview.core.root_cause import RootCauseAnalysis
+    from evalview.core.healing import HealingSummary
+    from evalview.core.model_runtime_detector import ModelRuntimeChangeSummary
+
+
+def _aggregate_token_summary(
+    results: Optional[List["EvaluationResult"]],
+    golden_traces: Optional[Dict[str, "GoldenTrace"]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Aggregate token usage and cost across test results.
+    
+    Computes total input/output/cached tokens and cost from all results.
+    Optionally calculates baseline comparison if golden traces are provided.
+    
+    Args:
+        results: List of evaluation results with token data
+        golden_traces: Optional baseline traces for comparison
+        
+    Returns:
+        Dict with token_usage, total_cost, baseline_token_usage, and token_delta_pct,
+        or None if no token data is available.
+    """
+    from evalview.core.types import TokenUsage
+
+    if not results:
+        return None
+
+    total_cost = 0.0
+    total_input = 0
+    total_output = 0
+    total_cached = 0
+    has_tokens = False
+
+    for r in results:
+        try:
+            total_cost += float(getattr(r.trace.metrics, "total_cost", 0) or 0)
+        except Exception:
+            pass
+
+        tu = getattr(getattr(r, "trace", None), "metrics", None)
+        tu = getattr(tu, "total_tokens", None)
+        if tu is None:
+            continue
+
+        has_tokens = True
+        total_input += int(getattr(tu, "input_tokens", 0) or 0)
+        total_output += int(getattr(tu, "output_tokens", 0) or 0)
+        total_cached += int(getattr(tu, "cached_tokens", 0) or 0)
+
+    if not has_tokens:
+        return None
+
+    current = TokenUsage(
+        input_tokens=total_input,
+        output_tokens=total_output,
+        cached_tokens=total_cached,
+    )
+
+    baseline_usage: Optional[TokenUsage] = None
+    delta_pct: Optional[float] = None
+    if golden_traces:
+        base_input = 0
+        base_output = 0
+        base_cached = 0
+        base_has_tokens = False
+        for r in results:
+            g = golden_traces.get(r.test_case)
+            if not g:
+                continue
+            gtu = getattr(getattr(g, "trace", None), "metrics", None)
+            gtu = getattr(gtu, "total_tokens", None)
+            if gtu is None:
+                continue
+            base_has_tokens = True
+            base_input += int(getattr(gtu, "input_tokens", 0) or 0)
+            base_output += int(getattr(gtu, "output_tokens", 0) or 0)
+            base_cached += int(getattr(gtu, "cached_tokens", 0) or 0)
+
+        if base_has_tokens:
+            baseline_usage = TokenUsage(
+                input_tokens=base_input,
+                output_tokens=base_output,
+                cached_tokens=base_cached,
+            )
+            if baseline_usage.total_tokens > 0:
+                delta_pct = (current.total_tokens - baseline_usage.total_tokens) / baseline_usage.total_tokens * 100.0
+
+    return {  # type: ignore[return-value]
+        "token_usage": current,
+        "total_cost": float(total_cost),
+        "baseline_token_usage": baseline_usage,
+        "token_delta_pct": delta_pct,
+    }
+
+
+def _build_score_trend_payload(
+    diffs: List[Tuple[str, "TraceDiff"]],
+    drift_tracker: Optional["DriftTracker"],
+) -> Optional[Dict[str, Any]]:
+    """Build a conservative suite-level score-trend summary for CI JSON."""
+    if drift_tracker is None:
+        return None
+
+    from dataclasses import asdict
+
+    from evalview.core.trends import DEFAULT_SCORE_TREND_WINDOW
+
+    by_test: Dict[str, Dict[str, Any]] = {}
+    for name, _ in diffs:
+        trend = drift_tracker.get_score_trend(name, window=DEFAULT_SCORE_TREND_WINDOW)
+        if trend.run_count > 0:
+            by_test[name] = asdict(trend)
+
+    if not by_test:
+        return None
+
+    worsening = sorted(
+        name for name, trend in by_test.items() if trend["direction"] == "worsening"
+    )
+    improving = sorted(
+        name for name, trend in by_test.items() if trend["direction"] == "improving"
+    )
+
+    # A worsening test wins over improvements elsewhere so `.trend.direction`
+    # is safe to use as a conservative CI gate across a multi-test suite.
+    direction = "worsening" if worsening else "improving" if improving else "stable"
+    return {
+        "direction": direction,
+        "significant": direction != "stable",
+        "window": DEFAULT_SCORE_TREND_WINDOW,
+        "worsening_tests": worsening,
+        "improving_tests": improving,
+        "tests": by_test,
+    }
+
+
+def _print_parameter_diffs(tool_diffs: List["ToolDiff"]) -> None:
+    """Print parameter-level differences for tool calls."""
+    from rich.table import Table
+
+    has_param_diffs = any(td.parameter_diffs for td in tool_diffs)
+    if not has_param_diffs:
+        return
+
+    table = Table(
+        title="Parameter Changes",
+        show_header=True,
+        header_style="bold",
+        show_lines=False,
+        padding=(0, 1),
+    )
+    table.add_column("Step", style="dim", width=5)
+    table.add_column("Tool", style="cyan", min_width=12)
+    table.add_column("Param", style="bold", min_width=10)
+    table.add_column("Baseline", min_width=15)
+    table.add_column("Current", min_width=15)
+    table.add_column("", width=8)
+
+    for td in tool_diffs:
+        if not td.parameter_diffs:
+            continue
+        tool_name = td.golden_tool or td.actual_tool or "?"
+        for pd in td.parameter_diffs:
+            # Format the change indicator
+            if pd.diff_type == "missing":
+                indicator = "[red]-removed[/red]"
+                golden_val = str(pd.golden_value)[:40]
+                actual_val = "[dim]—[/dim]"
+            elif pd.diff_type == "added":
+                indicator = "[green]+added[/green]"
+                golden_val = "[dim]—[/dim]"
+                actual_val = str(pd.actual_value)[:40]
+            elif pd.similarity is not None:
+                pct = int(pd.similarity * 100)
+                color = "green" if pct >= 80 else "yellow" if pct >= 50 else "red"
+                indicator = f"[{color}]{pct}%[/{color}]"
+                golden_val = str(pd.golden_value)[:40]
+                actual_val = str(pd.actual_value)[:40]
+            else:
+                indicator = "[yellow]~[/yellow]"
+                golden_val = str(pd.golden_value)[:40]
+                actual_val = str(pd.actual_value)[:40]
+
+            table.add_row(
+                str(td.position + 1),
+                tool_name,
+                pd.param_name,
+                golden_val,
+                actual_val,
+                indicator,
+            )
+
+    console.print(table)
+    console.print()
+
+
+def _print_output_diff(diff: "TraceDiff") -> None:
+    """Print output similarity and unified diff excerpt."""
+    if not diff.output_diff:
+        return
+
+    od = diff.output_diff
+    if od.similarity >= 0.95:
+        return  # Close enough, don't show
+
+    # Similarity line
+    sim_pct = int(od.similarity * 100)
+    sim_color = "green" if sim_pct >= 80 else "yellow" if sim_pct >= 50 else "red"
+    parts = [f"[{sim_color}]{sim_pct}% lexical[/{sim_color}]"]
+    if od.semantic_similarity is not None:
+        sem_pct = int(od.semantic_similarity * 100)
+        sem_color = "green" if sem_pct >= 80 else "yellow" if sem_pct >= 50 else "red"
+        parts.append(f"[{sem_color}]{sem_pct}% semantic[/{sem_color}]")
+    console.print(f"    Output similarity: {' / '.join(parts)}")
+
+    # Show a few diff lines (max 8) for context
+    meaningful_lines = [
+        line for line in od.diff_lines
+        if line.startswith("+") or line.startswith("-")
+        if not line.startswith("+++") and not line.startswith("---")
+    ]
+    if meaningful_lines:
+        for line in meaningful_lines[:8]:
+            if line.startswith("+"):
+                console.print(f"      [green]{line}[/green]")
+            else:
+                console.print(f"      [red]{line}[/red]")
+        if len(meaningful_lines) > 8:
+            console.print(f"      [dim]... {len(meaningful_lines) - 8} more lines[/dim]")
+    console.print()
+
+
+def _print_narrative(root_cause: "RootCauseAnalysis") -> None:
+    """Print the --explain narrative panel (shown before technical root cause)."""
+    from rich.panel import Panel
+
+    if not root_cause.narrative_root_cause:
+        return
+
+    console.print(Panel(
+        f"[bold]🔍 Analysis[/bold]\n\n{root_cause.narrative_root_cause}",
+        border_style="cyan",
+        padding=(0, 1),
+    ))
+
+
+def _print_root_cause(root_cause: "RootCauseAnalysis") -> None:
+    """Print root cause attribution for a regression."""
+    from rich.panel import Panel
+
+    # Narrative (--explain) is shown first, prominently
+    _print_narrative(root_cause)
+
+    confidence_color = {
+        "high": "green",
+        "medium": "yellow",
+        "low": "dim",
+    }.get(root_cause.confidence.value, "dim")
+
+    lines = [
+        f"[bold]Root cause:[/bold] {root_cause.category.value} ([{confidence_color}]{root_cause.confidence.value} confidence[/{confidence_color}])",
+        f"  [dim]→[/dim] {root_cause.summary}",
+    ]
+    if root_cause.suggested_fix:
+        lines.append(f"  [dim]Fix:[/dim] {root_cause.suggested_fix}")
+
+    if root_cause.ai_explanation:
+        lines.append(f"  [cyan]🤖 AI:[/cyan] {root_cause.ai_explanation}")
+
+    console.print(Panel(
+        "\n".join(lines),
+        border_style="red" if root_cause.confidence.value == "high" else "yellow",
+        padding=(0, 1),
+    ))
+
+
+def _print_recommendations(recs: list) -> None:
+    """Print actionable improvement recommendations."""
+    from rich.panel import Panel
+
+    if not recs:
+        return
+
+    lines = ["[bold]Suggested fixes:[/bold]"]
+    for rec in recs:
+        conf_color = {"high": "green", "medium": "yellow", "low": "dim"}.get(rec.confidence, "dim")
+        lines.append(
+            f"  [{conf_color}]●[/{conf_color}] [bold]{rec.action}[/bold] "
+            f"[dim]({rec.category})[/dim]"
+        )
+        lines.append(f"    [dim]{rec.detail}[/dim]")
+
+    console.print(Panel(
+        "\n".join(lines),
+        border_style="blue",
+        padding=(0, 1),
+    ))
+
+
+def _build_behavior_summary(
+    diffs: List[Tuple[str, "TraceDiff"]],
+    test_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
+    healing_summary: Optional["HealingSummary"] = None,
+) -> List[Dict[str, Any]]:
+    from collections import defaultdict
+    from evalview.core.diff import DiffStatus
+    from evalview.core.healing import HealingAction
+
+    heal_by_name: Dict[str, Any] = {}
+    if healing_summary:
+        heal_by_name = {r.test_name: r for r in healing_summary.results}
+
+    grouped: Dict[str, Dict[str, int]] = defaultdict(
+        lambda: {
+            "total": 0,
+            "passed": 0,
+            "changed": 0,
+            "regressions": 0,
+            "healed": 0,
+            "review": 0,
+            "blocked": 0,
+        }
+    )
+
+    for name, diff in diffs:
+        meta = (test_metadata or {}).get(name, {})
+        tags = list(meta.get("tags") or [])
+        buckets = tags or ["untagged"]
+        heal_result = heal_by_name.get(name)
+
+        for tag in buckets:
+            row = grouped[tag]
+            row["total"] += 1
+            if diff.overall_severity == DiffStatus.PASSED:
+                row["passed"] += 1
+            elif diff.overall_severity == DiffStatus.REGRESSION:
+                row["regressions"] += 1
+            else:
+                row["changed"] += 1
+
+            if heal_result:
+                if heal_result.healed:
+                    row["healed"] += 1
+                elif heal_result.diagnosis.action == HealingAction.FLAG_REVIEW:
+                    row["review"] += 1
+                elif heal_result.diagnosis.action == HealingAction.BLOCKED:
+                    row["blocked"] += 1
+
+    return [
+        {"tag": tag, **counts}
+        for tag, counts in sorted(grouped.items(), key=lambda item: item[0])
+    ]
+
+
+def _print_behavior_summary(summary_rows: List[Dict[str, Any]]) -> None:
+    if not summary_rows:
+        return
+
+    console.print("  [bold]By behavior:[/bold]")
+    for row in summary_rows:
+        parts = [f"{row['total']} test{'s' if row['total'] != 1 else ''}"]
+        if row["passed"]:
+            parts.append(f"{row['passed']} passed")
+        if row["changed"]:
+            parts.append(f"{row['changed']} changed")
+        if row["regressions"]:
+            parts.append(f"{row['regressions']} regression{'s' if row['regressions'] != 1 else ''}")
+        if row["healed"]:
+            parts.append(f"{row['healed']} healed")
+        if row["review"]:
+            parts.append(f"{row['review']} review")
+        if row["blocked"]:
+            parts.append(f"{row['blocked']} blocked")
+        console.print(f"  - {row['tag']}: {', '.join(parts)}")
+    console.print()
+
+
+def _print_model_runtime_summary(summary: Optional["ModelRuntimeChangeSummary"]) -> None:
+    """Print a run-level model/runtime change summary when detected."""
+    from rich.panel import Panel
+
+    if summary is None or not summary.detected:
+        return
+
+    title = "⚠  Model/Runtime Change Detected" if summary.classification == "declared" else "⚠  Possible Model/Runtime Update"
+    color = "yellow" if summary.confidence != "high" else "red"
+    lines = [
+        f"[bold]Signal:[/bold] {summary.classification}  [dim]({summary.confidence} confidence)[/dim]",
+        f"[bold]Affected tests:[/bold] {summary.affected_count}",
+    ]
+    if summary.baseline_fingerprints and summary.current_fingerprints:
+        lines.append(
+            f"[bold]Runtime fingerprint:[/bold] [dim]{summary.baseline_fingerprints[0]}[/dim] → [bold]{summary.current_fingerprints[0]}[/bold]"
+        )
+    for evidence in summary.evidence[:3]:
+        lines.append(f"  [dim]•[/dim] {evidence}")
+    lines.append(
+        "If the new behavior is correct, run [bold]evalview snapshot[/bold] to accept the new baseline."
+    )
+
+    console.print(Panel("\n".join(lines), title=title, border_style=color))
+    console.print()
+
+
+def _print_inline_trajectory(diff: "TraceDiff", golden: Optional["GoldenTrace"], result: Optional["EvaluationResult"]) -> None:
+    """Print a compact inline trajectory comparison for check output."""
+    golden_seq: List[str] = []
+    actual_seq: List[str] = []
+
+    if golden:
+        golden_seq = golden.tool_sequence or []
+    if result:
+        try:
+            actual_seq = [
+                str(getattr(s, "tool_name", None) or getattr(s, "step_name", "?"))
+                for s in (result.trace.steps or [])
+            ]
+        except AttributeError:
+            pass
+
+    if not golden_seq and not actual_seq:
+        return
+
+    if golden_seq != actual_seq:
+        console.print(f"    [dim]Baseline:[/dim] {' → '.join(golden_seq) or '(none)'}")
+        console.print(f"    [dim]Current:[/dim]  {' → '.join(actual_seq) or '(none)'}")
+
+
+def _print_passed_summary(
+    diffs: List[Tuple[str, "TraceDiff"]],
+    result_by_name: Dict[str, Any],
+    golden_traces: Optional[Dict[str, "GoldenTrace"]] = None,
+) -> None:
+    """Print a compact summary of what was verified when all tests pass.
+
+    Shows each test with its score, tool match status, and output similarity
+    so users have evidence that real work was done.
+    """
+    _goldens = golden_traces or {}
+    for name, diff in diffs:
+        result = result_by_name.get(name)
+        score_str = f"{result.score:.1f}" if result else "?"
+
+        parts = [f"[green]✓[/green] {name:<30s} [bold]{score_str}[/bold]"]
+
+        # Tool match status
+        if not diff.tool_diffs:
+            parts.append("[green]tools ✓[/green]")
+        else:
+            parts.append(f"[yellow]tools ~{len(diff.tool_diffs)} changed[/yellow]")
+
+        # Output similarity
+        if diff.output_diff:
+            sim_pct = int(diff.output_diff.similarity * 100)
+            if sim_pct >= 95:
+                parts.append(f"[green]output {sim_pct}%[/green]")
+            else:
+                color = "yellow" if sim_pct >= 80 else "red"
+                parts.append(f"[{color}]output {sim_pct}%[/{color}]")
+
+        # Multi-turn indicator
+        if diff.turn_diffs:
+            n_turns = len(diff.turn_diffs)
+            parts.append(f"[dim]({n_turns} turns)[/dim]")
+
+        console.print("  " + "  ".join(parts))
+
+    # Summary line with test type breakdown
+    n_multi = sum(1 for _, d in diffs if d.turn_diffs)
+    n_single = len(diffs) - n_multi
+    type_parts = []
+    if n_single:
+        type_parts.append(f"{n_single} single-turn")
+    if n_multi:
+        type_parts.append(f"{n_multi} multi-turn")
+    if type_parts:
+        console.print(f"  [dim]{len(diffs)} tests checked: {', '.join(type_parts)}[/dim]")
+    console.print()
+
+
+def _display_check_results(
+    diffs: List[Tuple[str, "TraceDiff"]],
+    analysis: Dict[str, Any],
+    state: "ProjectState",
+    is_first_check: bool,
+    json_output: bool,
+    drift_tracker: Optional["DriftTracker"] = None,
+    golden_traces: Optional[Dict[str, "GoldenTrace"]] = None,
+    results: Optional[List["EvaluationResult"]] = None,
+    ai_root_causes: Optional[Dict[str, Any]] = None,
+    test_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
+    healing_summary: Optional["HealingSummary"] = None,
+    model_runtime_summary: Optional["ModelRuntimeChangeSummary"] = None,
+    verdict_payload: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Display check results in JSON or console format."""
+    import json
+
+    from evalview.core.diff import DiffStatus
+    from evalview.core.celebrations import Celebrations
+    from evalview.core.drift_tracker import DriftTracker
+    from evalview.core.messages import get_random_clean_check_message
+    from evalview.core.root_cause import analyze_root_cause
+
+    # Build result lookup by test name
+    result_by_name: Dict[str, Any] = {}
+    if results:
+        for r in results:
+            result_by_name[r.test_case] = r
+
+    # Pre-compute root causes (use AI-enriched versions when available)
+    _ai_rc = ai_root_causes or {}
+    root_cause_by_name: Dict[str, Any] = {}
+    for name, diff in diffs:
+        rc = _ai_rc.get(name) or analyze_root_cause(diff)
+        root_cause_by_name[name] = rc
+    behavior_summary = _build_behavior_summary(diffs, test_metadata, healing_summary)
+
+    if json_output:
+        token_summary = _aggregate_token_summary(results, golden_traces)
+        score_trend_payload = _build_score_trend_payload(diffs, drift_tracker)
+        execution_failures = int(analysis.get("execution_failures", 0))
+        output: Dict[str, Any] = {
+            "summary": {
+                "total_tests": len(diffs),
+                "requested_tests": len(diffs) + execution_failures,
+                "execution_failures": execution_failures,
+                "unchanged": sum(1 for _, d in diffs if d.overall_severity == DiffStatus.PASSED),
+                "regressions": sum(1 for _, d in diffs if d.overall_severity == DiffStatus.REGRESSION),
+                "tools_changed": sum(1 for _, d in diffs if d.overall_severity == DiffStatus.TOOLS_CHANGED),
+                "output_changed": sum(1 for _, d in diffs if d.overall_severity == DiffStatus.OUTPUT_CHANGED),
+                "model_changed": any(getattr(d, "model_changed", False) for _, d in diffs),
+                "effective_all_passed": bool(analysis.get("effective_all_passed", analysis["all_passed"])),
+                "healing_all_resolved": bool(analysis.get("healing_all_resolved", False)),
+                "has_unresolved_failures": bool(analysis.get("has_unresolved_failures", not analysis["all_passed"])),
+            },
+            "diffs": [
+                {
+                    "test_name": name,
+                    "status": diff.overall_severity.value,
+                    "score_delta": diff.score_diff,
+                    "score_trend": (
+                        score_trend_payload["tests"].get(name)
+                        if score_trend_payload is not None
+                        else None
+                    ),
+                    "has_tool_diffs": len(diff.tool_diffs) > 0,
+                    "forbidden_tool_violations": diff.forbidden_tool_violations,
+                    "tool_diffs": [
+                        {
+                            "type": td.type,
+                            "position": td.position,
+                            "golden_tool": td.golden_tool,
+                            "actual_tool": td.actual_tool,
+                            "message": td.message,
+                            "parameter_diffs": [
+                                {
+                                    "param": pd.param_name,
+                                    "golden": pd.golden_value,
+                                    "actual": pd.actual_value,
+                                    "type": pd.diff_type,
+                                    "similarity": pd.similarity,
+                                }
+                                for pd in td.parameter_diffs
+                            ],
+                        }
+                        for td in diff.tool_diffs
+                    ],
+                    "output_similarity": diff.output_diff.similarity if diff.output_diff else 1.0,
+                    "semantic_similarity": (
+                        diff.output_diff.semantic_similarity if diff.output_diff else None
+                    ),
+                    "model_changed": getattr(diff, "model_changed", False),
+                    "golden_model_id": getattr(diff, "golden_model_id", None),
+                    "actual_model_id": getattr(diff, "actual_model_id", None),
+                    "runtime_fingerprint_changed": getattr(diff, "runtime_fingerprint_changed", False),
+                    "golden_runtime_fingerprint": getattr(diff, "golden_runtime_fingerprint", None),
+                    "actual_runtime_fingerprint": getattr(diff, "actual_runtime_fingerprint", None),
+                    "turn_diffs": [
+                        {
+                            "turn": td.turn_index,
+                            "baseline_tools": td.baseline_tools,
+                            "current_tools": td.current_tools,
+                            "status": td.status.value,
+                        }
+                        for td in (diff.turn_diffs or [])
+                    ] or None,
+                    "root_cause": (
+                        root_cause_by_name[name].to_dict()
+                        if root_cause_by_name.get(name) is not None
+                        else None
+                    ),
+                }
+                for name, diff in diffs
+            ],
+        }
+        if execution_failures:
+            output.update(
+                status="incomplete", passed=False,
+                error=f"{execution_failures} requested test(s) produced no comparison.",
+                missing_tests=analysis.get("missing_tests", []),
+            )
+        if analysis.get("budget_exhausted"):
+            output.update(status="incomplete", passed=False, error="The check reached its execution budget.")
+        if token_summary is not None:
+            output["summary"]["token_usage"] = token_summary["token_usage"].model_dump()
+            output["summary"]["total_cost"] = token_summary["total_cost"]
+            if token_summary.get("baseline_token_usage") is not None:
+                output["summary"]["baseline_token_usage"] = token_summary["baseline_token_usage"].model_dump()
+            if token_summary.get("token_delta_pct") is not None:
+                output["summary"]["token_delta_pct"] = token_summary["token_delta_pct"]
+        if score_trend_payload is not None:
+            output["trend"] = score_trend_payload
+        if healing_summary:
+            output["healing"] = {
+                "total_healed": healing_summary.total_healed,
+                "total_proposed": healing_summary.total_proposed,
+                "total_review": healing_summary.total_review,
+                "total_blocked": healing_summary.total_blocked,
+                "attempted_count": healing_summary.attempted_count,
+                "unresolved_count": healing_summary.unresolved_count,
+                "failed_count": healing_summary.failed_count,
+                "policy_version": healing_summary.policy_version,
+                "thresholds": healing_summary.thresholds,
+                "audit_path": healing_summary.audit_path,
+                "results": [r.model_dump() for r in healing_summary.results],
+            }
+        if model_runtime_summary:
+            output["model_runtime"] = model_runtime_summary.model_dump()
+        if behavior_summary:
+            output["behavior_summary"] = behavior_summary
+        if verdict_payload:
+            output["verdict"] = verdict_payload
+        # --- Observability signals from new analysis modules ---
+        _anomalies_json = []
+        _trust_json = []
+        _coherence_json = []
+        for r in (results or []):
+            if r.anomaly_report is not None:
+                _anomalies_json.append({"test": r.test_case, **r.anomaly_report})
+            if r.trust_report is not None:
+                _trust_json.append({"test": r.test_case, **r.trust_report})
+            if r.coherence_report is not None:
+                _coherence_json.append({"test": r.test_case, **r.coherence_report})
+        if _anomalies_json:
+            output["behavioral_anomalies"] = _anomalies_json
+        if _trust_json:
+            output["trust_scores"] = _trust_json
+        if _coherence_json:
+            output["coherence_analysis"] = _coherence_json
+        print(json.dumps(output, indent=2))
+    else:
+        # Console output with personality
+        from evalview.core.dashboard import (
+            render_scorecard,
+            render_sparklines,
+            render_confidence_label,
+            render_smart_accept_suggestion,
+        )
+
+        # --- Dashboard Scorecard ---
+        from evalview.core.quarantine import QuarantineStore
+        _q = QuarantineStore()
+
+        passed_count = sum(1 for _, d in diffs if d.overall_severity == DiffStatus.PASSED)
+        tools_changed_count = sum(1 for _, d in diffs if d.overall_severity == DiffStatus.TOOLS_CHANGED)
+        output_changed_count = sum(1 for _, d in diffs if d.overall_severity == DiffStatus.OUTPUT_CHANGED)
+        regression_count = sum(1 for _, d in diffs if d.overall_severity == DiffStatus.REGRESSION)
+        quarantined_failures = sum(
+            1 for name, d in diffs
+            if d.overall_severity != DiffStatus.PASSED
+            and not d.forbidden_tool_violations and _q.is_quarantined(name)
+        )
+        exec_failures = int(analysis.get("execution_failures", 0) or 0)
+        total_compared = len(diffs)
+        health_pct = (passed_count / total_compared * 100) if total_compared > 0 else 0.0
+
+        if diffs:
+            scorecard = render_scorecard(
+                passed=passed_count,
+                tools_changed=tools_changed_count,
+                output_changed=output_changed_count,
+                regressions=regression_count,
+                execution_failures=exec_failures,
+                current_streak=int(state.current_streak or 0),
+                longest_streak=int(state.longest_streak or 0),
+                health_pct=health_pct,
+            )
+            console.print(scorecard)
+            if quarantined_failures > 0:
+                console.print(
+                    f"  [dim]⏸ {quarantined_failures} quarantined test(s) failed (not blocking CI)[/dim]"
+                )
+            console.print()
+
+        token_summary = _aggregate_token_summary(results, golden_traces)
+        if token_summary is not None:
+            from rich.table import Table
+
+            tu = token_summary["token_usage"]  # type: ignore[assignment]
+            delta_pct = token_summary.get("token_delta_pct")
+            delta_str = ""
+            if delta_pct is not None:
+                sign = "+" if delta_pct > 0 else ""
+                color = "red" if delta_pct > 10 else "yellow" if delta_pct > 0 else "green"
+                delta_str = f"  [{color}]({sign}{delta_pct:.0f}% tokens vs baseline)[/{color}]"
+
+            table = Table(show_header=False, show_lines=False, padding=(0, 1))
+            table.add_column("k", style="dim", width=12)
+            table.add_column("v")
+            table.add_row("Tokens", f"in {tu.input_tokens:,}  out {tu.output_tokens:,}  cached {tu.cached_tokens:,}  total {tu.total_tokens:,}{delta_str}")
+            table.add_row("Cost", f"${float(token_summary['total_cost']):.4f}")
+            console.print(table)
+            console.print()
+
+        # --- Sparkline Trends ---
+        if diffs and drift_tracker is not None:
+            test_trends: Dict[str, List[float]] = {}
+            for _name, _diff in diffs:
+                history = drift_tracker.get_test_history(_name, limit=10)
+                # get_test_history returns newest-first; reverse for sparklines
+                similarities = [h["output_similarity"] for h in reversed(history)]
+                if similarities:
+                    test_trends[_name] = similarities
+
+            pass_trend = drift_tracker.get_pass_rate_trend(window=10)
+            sparkline_output = render_sparklines(test_trends, pass_trend)
+            if sparkline_output:
+                console.print(sparkline_output)
+                console.print()
+
+        # --- Aggregate anomaly/trust summary ---
+        from evalview.core.observability import extract_observability_summary
+        _obs = extract_observability_summary(results)
+        if _obs.has_signals:
+            if _obs.anomaly_count > 0:
+                console.print(
+                    f"  [yellow]\u26a0 {_obs.anomaly_count} test(s) with behavioral anomalies "
+                    f"(tool loops, stalls, brittle recovery)[/yellow]"
+                )
+            if _obs.low_trust_count > 0:
+                console.print(
+                    f"  [yellow]\u26a0 {_obs.low_trust_count} test(s) with low trust score "
+                    f"(possible benchmark gaming)[/yellow]"
+                )
+            console.print()
+
+        if is_first_check:
+            Celebrations.first_check()
+
+        if model_runtime_summary is not None:
+            _print_model_runtime_summary(model_runtime_summary)  # richer replacement for boolean model_changed banner
+
+        # Gradual drift warnings
+        _drift = drift_tracker if drift_tracker is not None else DriftTracker()
+        for name, _ in diffs:
+            warning = _drift.detect_gradual_drift(name)
+            if warning:
+                console.print(f"[yellow]📉 {name}:[/yellow] {warning}\n")
+
+        effective_all_passed = bool(analysis.get("effective_all_passed", analysis["all_passed"]))
+
+        if analysis["all_passed"]:
+            # Show what was verified so users can trust the result
+            if diffs:
+                _print_passed_summary(diffs, result_by_name, golden_traces)
+                console.print(f"[green]{get_random_clean_check_message()}[/green]\n")
+
+                # Always acknowledge the streak on a clean run — the first
+                # emotional beat after `evalview check` should be relief + pride,
+                # not silence. Celebrations.clean_check_streak handles the full
+                # range from streak=1 upward.
+                if state.current_streak >= 1:
+                    Celebrations.clean_check_streak(state)
+
+                if state.total_checks >= 5 and state.total_checks % 5 == 0:
+                    Celebrations.health_summary(state)
+            else:
+                from rich.panel import Panel as _Panel
+
+                console.print(
+                    _Panel(
+                        "[yellow]0 tests compared.[/yellow] "
+                        "Your test names don't match any golden baselines.\n\n"
+                        "This usually means tests were regenerated or renamed since the last snapshot.\n\n"
+                        "[bold]To fix:[/bold]\n"
+                        "  [bold]evalview snapshot[/bold]         capture new baselines for current tests\n"
+                        "  [bold]evalview snapshot --reset[/bold]  replace existing baselines once every selected test passes",
+                        border_style="yellow",
+                        title="No matching baselines",
+                        padding=(1, 2),
+                    )
+                )
+        else:
+            # Execution failures (tests that didn't produce diffs)
+            if exec_failures > 0:
+                console.print(
+                    f"  {exec_failures} execution "
+                    f"{'failure' if exec_failures == 1 else 'failures'}"
+                )
+                console.print()
+
+            # Build healing lookup
+            heal_by_name: Dict[str, Any] = {}
+            if healing_summary:
+                from evalview.core.healing import HealingAction
+                heal_by_name = {r.test_name: r for r in healing_summary.results}
+
+            # Model update banner (before per-test display)
+            if healing_summary and healing_summary.model_update:
+                mu = healing_summary.model_update
+                console.print(
+                    f"  [yellow]\u26a0 Model update detected:[/yellow] "
+                    f"[dim]{mu.golden_model}[/dim] \u2192 [bold]{mu.actual_model}[/bold] "
+                    f"({mu.affected_count} test{'s' if mu.affected_count != 1 else ''} affected)\n"
+                )
+
+            _goldens = golden_traces or {}
+            for name, diff in diffs:
+                if diff.overall_severity == DiffStatus.PASSED:
+                    continue
+
+                # Check if healing resolved this test
+                heal_result = heal_by_name.get(name)
+                if heal_result and heal_result.healed:
+                    console.print(
+                        f"  [green]\u26a1 HEALED[/green]: {name}  "
+                        f"[dim]{heal_result.diagnosis.reason}[/dim]"
+                    )
+                    continue
+                elif heal_result and heal_result.proposed:
+                    console.print(
+                        f"  [cyan]\u25c8 PROPOSED[/cyan]: {name}  "
+                        f"[dim]{heal_result.diagnosis.reason}[/dim]"
+                    )
+                    continue
+                elif heal_result and heal_result.diagnosis.action == HealingAction.BLOCKED:
+                    console.print(
+                        f"  [red]\u2717 BLOCKED[/red]: {name}  "
+                        f"[dim]{heal_result.diagnosis.reason}[/dim]"
+                    )
+                    continue
+                elif heal_result:
+                    # FLAG_REVIEW — show with review icon then fall through to details
+                    console.print(
+                        f"  [yellow]\u26a0 REVIEW[/yellow]: {name}  "
+                        f"[dim]{heal_result.diagnosis.reason}[/dim]"
+                    )
+                    # Fall through to show details below
+
+                if not heal_result:
+                    # Check if quarantined (uses _q loaded above in scorecard section)
+                    _is_quarantined = _q.is_quarantined(name)
+
+                    if diff.forbidden_tool_violations:
+                        severity_icon = "[red]✗ BLOCKED[/red]"
+                    elif _is_quarantined:
+                        severity_icon = "[dim]⏸ QUARANTINED[/dim]"
+                    else:
+                        severity_icon = {
+                            DiffStatus.REGRESSION: "[red]\u2717 REGRESSION[/red]",
+                            DiffStatus.TOOLS_CHANGED: "[yellow]\u26a0 TOOLS_CHANGED[/yellow]",
+                            DiffStatus.OUTPUT_CHANGED: "[dim]~ OUTPUT_CHANGED[/dim]",
+                        }.get(diff.overall_severity, "?")
+
+                    score_part = ""
+                    if abs(diff.score_diff) > 1:
+                        sign = "+" if diff.score_diff > 0 else ""
+                        score_color = "green" if diff.score_diff > 0 else "red"
+                        score_part = f"  [{score_color}]{sign}{diff.score_diff:.1f} pts[/{score_color}]"
+
+                    # Confidence label from historical variance
+                    confidence_str = ""
+                    if drift_tracker is not None:
+                        output_sim = diff.output_diff.similarity if diff.output_diff else 1.0
+                        conf_result = drift_tracker.compute_confidence(name, output_sim)
+                        if conf_result is not None:
+                            conf_pct, conf_label = conf_result
+                            confidence_str = "  " + render_confidence_label(conf_pct, conf_label)
+
+                    console.print(f"{severity_icon}: {name}{score_part}{confidence_str}")
+
+                meta = (test_metadata or {}).get(name, {})
+                tags = list(meta.get("tags") or [])
+                if tags:
+                    console.print(f"    [dim]Tags:[/dim] {', '.join(tags)}")
+                if meta.get("is_multi_turn"):
+                    behavior_class = str(meta.get("behavior_class") or "multi_turn").replace("_", " ")
+                    console.print(f"    [dim]Multi-turn path:[/dim] {behavior_class}")
+
+                golden_for_test = _goldens.get(name)
+                result_for_test = result_by_name.get(name)
+                _print_inline_trajectory(diff, golden_for_test, result_for_test)
+
+                if diff.tool_diffs:
+                    _print_parameter_diffs(diff.tool_diffs)
+
+                # Per-turn breakdown for multi-turn tests
+                if diff.turn_diffs:
+                    changed_turns = [td for td in diff.turn_diffs if td.status != DiffStatus.PASSED]
+                    if changed_turns:
+                        console.print("    [dim]Per-turn breakdown:[/dim]")
+                        for td in changed_turns:
+                            baseline_str = ", ".join(td.baseline_tools) or "(none)"
+                            current_str = ", ".join(td.current_tools) or "(none)"
+                            parts = []
+                            if td.baseline_tools != td.current_tools:
+                                parts.append(f"[red]{baseline_str}[/red] \u2192 [green]{current_str}[/green]")
+                            else:
+                                parts.append("tools OK")
+                            if td.output_similarity is not None:
+                                sim_pct = int(td.output_similarity * 100)
+                                sim_color = "green" if sim_pct >= 80 else "yellow" if sim_pct >= 50 else "red"
+                                parts.append(f"output [{sim_color}]{sim_pct}% similar[/{sim_color}]")
+                            console.print(
+                                f"      [yellow]Turn {td.turn_index}:[/yellow] "
+                                + ", ".join(parts)
+                            )
+
+                # Per-turn evaluation failures
+                if result_for_test and getattr(result_for_test, "turn_evaluations", None):
+                    failed_evals = [te for te in result_for_test.turn_evaluations if not te.passed]
+                    if failed_evals:
+                        console.print("    [dim]Per-turn evaluation:[/dim]")
+                        for te in failed_evals:
+                            console.print(
+                                f"      [red]Turn {te.turn_index}: FAIL[/red] \u2014 {te.details}"
+                            )
+
+                # --- Behavioral anomalies ---
+                if result_for_test and getattr(result_for_test, "anomaly_report", None):
+                    ar = result_for_test.anomaly_report
+                    for anom in ar.get("anomalies", [])[:3]:
+                        sev = anom.get("severity", "warning")
+                        icon = "[red]\u26a0[/red]" if sev == "error" else "[yellow]\u26a0[/yellow]"
+                        console.print(
+                            f"    {icon} [bold]{anom.get('pattern', '')}[/bold]: "
+                            f"{anom.get('description', '')[:120]}"
+                        )
+
+                # --- Trust score ---
+                if result_for_test and getattr(result_for_test, "trust_report", None):
+                    from evalview.core.observability import LOW_TRUST_THRESHOLD
+                    tr = result_for_test.trust_report
+                    trust_val = tr.get("trust_score", 1.0)
+                    if trust_val < 1.0:
+                        trust_color = "red" if trust_val < 0.5 else "yellow" if trust_val < LOW_TRUST_THRESHOLD else "dim"
+                        console.print(
+                            f"    [{trust_color}]Trust: {trust_val:.0%}[/{trust_color}] "
+                            f"[dim]({tr.get('summary', '')})[/dim]"
+                        )
+
+                # --- Coherence issues (multi-turn) ---
+                if result_for_test and getattr(result_for_test, "coherence_report", None):
+                    cr = result_for_test.coherence_report
+                    for issue in cr.get("issues", [])[:2]:
+                        sev = issue.get("severity", "warning")
+                        icon = "[red]\u26a0[/red]" if sev == "error" else "[yellow]\u26a0[/yellow]"
+                        console.print(
+                            f"    {icon} [bold]{issue.get('category', '')}[/bold]: "
+                            f"{issue.get('description', '')[:120]}"
+                        )
+
+                _print_output_diff(diff)
+
+                root_cause = root_cause_by_name.get(name)
+                if root_cause is not None:
+                    _print_root_cause(root_cause)
+
+                from evalview.core.recommendations import recommend_from_trace_diff
+                recs = recommend_from_trace_diff(diff)
+                if recs:
+                    _print_recommendations(recs)
+
+                # Track flaky tests and suggest quarantine
+                if not diff.forbidden_tool_violations and diff.output_diff and diff.output_diff.similarity and diff.output_diff.similarity > 0.9 and abs(diff.score_diff) < 3:
+                    count = _q.increment_flaky(name)
+                    if _q.should_quarantine(name) and not _q.is_quarantined(name):
+                        quoted_q = f'"{name}"' if " " in name else name
+                        console.print(
+                            f"    [yellow]💡 This test has been flaky {count} times. "
+                            f"Consider: [bold]evalview quarantine add {quoted_q}[/bold][/yellow]"
+                        )
+
+                quoted = f'"{name}"' if " " in name else name
+                console.print(f"    [dim]\u2192 evalview replay {quoted}[/dim]")
+
+                # Smart accept suggestion
+                if result_for_test is not None and not diff.forbidden_tool_violations:
+                    golden_for_accept = _goldens.get(name)
+                    baseline_score = (
+                        result_for_test.score - diff.score_diff
+                        if diff.score_diff is not None
+                        else 0.0
+                    )
+                    baseline_tools = (
+                        golden_for_accept.tool_sequence if golden_for_accept else []
+                    )
+                    current_tools = [
+                        str(getattr(s, "tool_name", None) or getattr(s, "step_name", "?"))
+                        for s in (result_for_test.trace.steps or [])
+                    ]
+                    accept_panel = render_smart_accept_suggestion(
+                        test_name=name,
+                        score_improved=(diff.score_diff > 0) if diff.score_diff is not None else False,
+                        tools_changed=bool(diff.tool_diffs),
+                        baseline_tools=baseline_tools,
+                        current_tools=current_tools,
+                        baseline_score=baseline_score,
+                        current_score=result_for_test.score,
+                    )
+                    if accept_panel:
+                        console.print(accept_panel)
+
+                console.print()
+
+            # Healing summary footer
+            if healing_summary and healing_summary.model_update:
+                mu = healing_summary.model_update
+                if mu.healed_count == mu.affected_count:
+                    console.print(
+                        f"  [green]Model update:[/green] all {mu.affected_count} affected tests healed via retry. "
+                        f"Run [bold]evalview snapshot[/bold] to rebase."
+                    )
+                elif mu.healed_count > 0:
+                    console.print(
+                        f"  [yellow]Model update:[/yellow] {mu.healed_count} of {mu.affected_count} affected tests healed. "
+                        f"{mu.failed_count} still failing \u2014 review before rebasing."
+                    )
+                else:
+                    console.print(
+                        f"  [red]Model update:[/red] broke {mu.failed_count} tests. Review before rebasing."
+                    )
+
+            if healing_summary and healing_summary.results:
+                parts = []
+                if healing_summary.total_healed:
+                    parts.append(f"{healing_summary.total_healed} resolved")
+                if healing_summary.total_proposed:
+                    parts.append(
+                        f"{healing_summary.total_proposed} candidate "
+                        f"variant{'s' if healing_summary.total_proposed != 1 else ''} saved"
+                    )
+                if healing_summary.total_review:
+                    parts.append(
+                        f"{healing_summary.total_review} "
+                        f"need{'s' if healing_summary.total_review == 1 else ''} review"
+                    )
+                if healing_summary.total_blocked:
+                    parts.append(f"{healing_summary.total_blocked} blocked")
+                console.print(f"\n  {', '.join(parts)}.")
+                if effective_all_passed:
+                    console.print("  [green]All detected failures were resolved by bounded retry healing.[/green]")
+                if healing_summary.audit_path:
+                    console.print(f"  [dim]Audit log: {healing_summary.audit_path}[/dim]")
+                console.print()
+
+            _print_behavior_summary(behavior_summary)
+
+            if analysis.get("has_unresolved_failures", analysis["has_regressions"]):
+                Celebrations.regression_guidance("See details above")
+
+
+def _print_trajectory_diff(golden: Any, result: Any) -> None:
+    """Print a side-by-side terminal trajectory comparison (golden vs actual)."""
+    from rich.table import Table
+    from rich.text import Text
+
+    golden_steps: List[Any] = []
+    actual_steps: List[Any] = []
+    try:
+        golden_steps = golden.trace.steps or []
+    except AttributeError:
+        pass
+    try:
+        actual_steps = result.trace.steps or []
+    except AttributeError:
+        pass
+
+    if not golden_steps and not actual_steps:
+        console.print("[dim]No tool steps in either trace — both are direct responses.[/dim]\n")
+        return
+
+    max_steps = max(len(golden_steps), len(actual_steps))
+
+    table = Table(
+        title="Trajectory Diff",
+        show_header=True,
+        header_style="bold",
+        show_lines=True,
+    )
+    table.add_column("#", style="dim", width=3)
+    table.add_column("Baseline", min_width=30)
+    table.add_column("Current", min_width=30)
+    table.add_column("", justify="center", width=3)
+
+    for i in range(max_steps):
+        g = golden_steps[i] if i < len(golden_steps) else None
+        a = actual_steps[i] if i < len(actual_steps) else None
+
+        g_name: str = str((getattr(g, "tool_name", None) or getattr(g, "step_name", "?")) if g else "—")
+        a_name: str = str((getattr(a, "tool_name", None) or getattr(a, "step_name", "?")) if a else "—")
+
+        match = g_name == a_name
+        match_str = "[green]✓[/green]" if match else "[red]✗[/red]"
+
+        if match:
+            g_style, a_style = "cyan", "cyan"
+        elif a_name == "—":
+            g_style, a_style = "cyan", "red"   # step was dropped
+        elif g_name == "—":
+            g_style, a_style = "dim", "yellow"  # new step added
+        else:
+            g_style, a_style = "cyan", "yellow"  # step changed
+
+        table.add_row(str(i + 1), Text(g_name, style=g_style), Text(a_name, style=a_style), match_str)
+
+    console.print(table)
+    console.print()
+
+    golden_seq = [str(getattr(s, "tool_name", None) or getattr(s, "step_name", "?")) for s in golden_steps]
+    actual_seq = [str(getattr(s, "tool_name", None) or getattr(s, "step_name", "?")) for s in actual_steps]
+
+    if golden_seq == actual_seq:
+        console.print("[green]Tool sequence: identical[/green]\n")
+    else:
+        console.print("[yellow]Tool sequence changed:[/yellow]")
+        console.print(f"  Baseline: {' → '.join(golden_seq) or '(none)'}")
+        console.print(f"  Current:  {' → '.join(actual_seq) or '(none)'}\n")

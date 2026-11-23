@@ -1,0 +1,330 @@
+"""Production replay pipeline — take a failed trace, re-execute, and diff.
+
+Connects the existing import, run, and diff engines into a single pipeline:
+
+    production trace → parse → re-execute against live agent → diff vs original
+
+This directly addresses the "demo-to-prod gap" complaint: teams can take a
+real production failure, replay it against the current agent, and get a
+structured diff showing what changed.
+
+Usage:
+    from evalview.core.replay_pipeline import ReplayPipeline
+
+    pipeline = ReplayPipeline(adapter_name="http", endpoint="http://localhost:8080")
+    report = await pipeline.replay_trace(original_trace)
+    print(report.summary())
+
+The pipeline is intentionally simple — it's a coordinator, not a new engine.
+It reuses DiffEngine and the adapter system.
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+from evalview.core.diff import DiffEngine, DiffConfig, TraceDiff
+from evalview.core.golden import GoldenMetadata, GoldenTrace
+from evalview.core.types import ExecutionTrace
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Data types
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ReplayResult:
+    """Result of replaying a single production trace."""
+
+    original_trace: ExecutionTrace
+    replay_trace: Optional[ExecutionTrace] = None
+    diff: Optional[TraceDiff] = None
+    error: Optional[str] = None
+    replay_score: float = 0.0
+
+    @property
+    def succeeded(self) -> bool:
+        return self.replay_trace is not None and self.error is None
+
+    @property
+    def has_differences(self) -> bool:
+        return self.diff is not None and self.diff.has_differences
+
+    @property
+    def status(self) -> str:
+        if self.error:
+            return "error"
+        if self.diff is None:
+            return "unknown"
+        return self.diff.overall_severity.value
+
+    def summary(self) -> str:
+        if self.error:
+            return f"Replay failed: {self.error}"
+        if self.diff is None:
+            return "Replay completed but no diff available"
+        if not self.diff.has_differences:
+            return "Replay matches original — behavior is stable"
+
+        parts = [f"Status: {self.diff.overall_severity.value}"]
+        if self.diff.tool_diffs:
+            parts.append(f"{len(self.diff.tool_diffs)} tool change(s)")
+        if self.diff.output_diff:
+            parts.append(f"output similarity: {self.diff.output_diff.similarity:.0%}")
+        if self.diff.score_diff != 0:
+            parts.append(f"score delta: {self.diff.score_diff:+.1f}")
+        return " | ".join(parts)
+
+
+@dataclass
+class ReplayBatchResult:
+    """Result of replaying multiple production traces."""
+
+    results: List[ReplayResult] = field(default_factory=list)
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+    @property
+    def total(self) -> int:
+        return len(self.results)
+
+    @property
+    def succeeded(self) -> int:
+        return sum(1 for r in self.results if r.succeeded)
+
+    @property
+    def failed(self) -> int:
+        return sum(1 for r in self.results if r.error)
+
+    @property
+    def changed(self) -> int:
+        return sum(1 for r in self.results if r.has_differences)
+
+    @property
+    def stable(self) -> int:
+        return sum(1 for r in self.results if r.succeeded and not r.has_differences)
+
+    def summary(self) -> str:
+        if not self.results:
+            return "No traces replayed"
+        return (
+            f"Replayed {self.total} trace(s): "
+            f"{self.stable} stable, {self.changed} changed, "
+            f"{self.failed} failed"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Trace → Golden conversion
+# ---------------------------------------------------------------------------
+
+
+def _get_tool_sequence(trace: ExecutionTrace) -> List[str]:
+    """Extract ordered tool names from a trace."""
+    return [step.tool_name for step in trace.steps]
+
+
+def trace_to_golden(
+    trace: ExecutionTrace,
+    test_name: str = "replay",
+    score: float = 100.0,
+) -> GoldenTrace:
+    """Convert a production trace into a GoldenTrace for diffing.
+
+    The original production trace becomes the "blessed" baseline that
+    the replay is compared against.
+    """
+    tool_sequence = _get_tool_sequence(trace)
+
+    metadata = GoldenMetadata(
+        test_name=test_name,
+        blessed_at=trace.start_time,
+        blessed_by="production-replay",
+        score=score,
+        model_id=trace.model_id,
+        model_provider=trace.model_provider,
+    )
+
+    return GoldenTrace(
+        metadata=metadata,
+        trace=trace,
+        tool_sequence=tool_sequence,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
+
+
+class ReplayPipeline:
+    """Orchestrates production trace replay and diffing.
+
+    Takes a production execution trace, re-runs the same query against
+    the current agent, and produces a structured diff showing what changed.
+    """
+
+    def __init__(
+        self,
+        adapter_name: str = "http",
+        endpoint: Optional[str] = None,
+        adapter_config: Optional[Dict[str, Any]] = None,
+        diff_config: Optional[DiffConfig] = None,
+        timeout: float = 120.0,
+    ):
+        """Initialize the replay pipeline.
+
+        Args:
+            adapter_name: Which adapter to use for replay (e.g., "http", "anthropic").
+            endpoint: Agent endpoint URL.
+            adapter_config: Additional adapter configuration.
+            diff_config: Optional DiffConfig for the diff engine.
+            timeout: Per-replay timeout in seconds.
+        """
+        self.adapter_name = adapter_name
+        self.endpoint = endpoint
+        self.adapter_config = adapter_config or {}
+        self.timeout = timeout
+        self.diff_engine = DiffEngine(config=diff_config)
+
+    def _get_adapter(self) -> Any:
+        """Create the agent adapter (separate method for testability)."""
+        from evalview.core.adapter_factory import create_adapter
+
+        return create_adapter(
+            adapter_type=self.adapter_name,
+            endpoint=self.endpoint or "",
+            timeout=self.timeout,
+        )
+
+    async def replay_trace(
+        self,
+        original_trace: ExecutionTrace,
+        query: Optional[str] = None,
+        test_name: str = "replay",
+        original_score: float = 100.0,
+    ) -> ReplayResult:
+        """Replay a single production trace and diff against original.
+
+        Args:
+            original_trace: The original production trace to replay.
+            query: The original user query. If not provided, uses the
+                  first step's parameters or the final output.
+            test_name: Name for the test case.
+            original_score: Score to assign to the original (baseline).
+
+        Returns:
+            ReplayResult with the original, replay, and diff.
+        """
+        # Convert original to golden baseline
+        golden = trace_to_golden(original_trace, test_name, original_score)
+
+        # Extract query from trace if not provided
+        if query is None:
+            query = _extract_query(original_trace)
+
+        try:
+            adapter = self._get_adapter()
+            replay_result_trace = await adapter.execute(query)
+
+            # Diff the replay against the original
+            diff = self.diff_engine.compare(golden, replay_result_trace, actual_score=0.0)
+
+            return ReplayResult(
+                original_trace=original_trace,
+                replay_trace=replay_result_trace,
+                diff=diff,
+            )
+
+        except Exception as e:
+            logger.error("Replay failed: %s", e)
+            return ReplayResult(
+                original_trace=original_trace,
+                error=str(e),
+            )
+
+    async def replay_batch(
+        self,
+        traces: List[ExecutionTrace],
+        queries: Optional[List[Optional[str]]] = None,
+        concurrency: int = 5,
+    ) -> ReplayBatchResult:
+        """Replay multiple production traces.
+
+        Args:
+            traces: List of production traces to replay.
+            queries: Optional parallel list of original queries.
+            concurrency: Maximum number of concurrent replays (default 5).
+                         Set to 1 for sequential execution.
+
+        Returns:
+            ReplayBatchResult with per-trace results.
+        """
+        import asyncio
+
+        batch = ReplayBatchResult(started_at=datetime.now())
+        queries = queries or [None] * len(traces)
+        concurrency = max(1, concurrency)
+
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def _bounded_replay(
+            index: int, trace: ExecutionTrace, query: Optional[str],
+        ) -> Tuple[int, ReplayResult]:
+            async with semaphore:
+                result = await self.replay_trace(
+                    original_trace=trace,
+                    query=query,
+                    test_name=f"replay-{index + 1}",
+                )
+                return (index, result)
+
+        tasks = [
+            _bounded_replay(i, trace, query)
+            for i, (trace, query) in enumerate(zip(traces, queries))
+        ]
+        completed = await asyncio.gather(*tasks)
+
+        # Restore original order (gather preserves order, but be explicit)
+        ordered = sorted(completed, key=lambda pair: pair[0])
+        batch.results = [result for _, result in ordered]
+
+        batch.completed_at = datetime.now()
+        return batch
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _extract_query(trace: ExecutionTrace) -> str:
+    """Best-effort extraction of the original query from a trace.
+
+    Tries several heuristics:
+    1. First step's parameters for common query fields
+    2. First turn's query (multi-turn traces)
+    3. Falls back to describing the tool sequence
+    """
+    # Try multi-turn traces first
+    if trace.turns and trace.turns[0].query:
+        return trace.turns[0].query
+
+    # Try first step's parameters
+    if trace.steps:
+        first_params = trace.steps[0].parameters
+        for key in ("query", "prompt", "message", "input", "question", "user_message"):
+            if key in first_params and isinstance(first_params[key], str):
+                return first_params[key]
+
+    # Fall back to describing what the trace did
+    if trace.steps:
+        tools = [s.tool_name for s in trace.steps[:3]]
+        return f"[replay] Original trace used: {', '.join(tools)}"
+
+    return "[replay] No query could be extracted from trace"

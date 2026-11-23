@@ -1,0 +1,65 @@
+{
+  "name": "evalview",
+  "version": "0.6.2",
+  "description": "Drop-in Node.js middleware for EvalView — the open-source regression testing framework for AI agents. Golden baseline diffing and CI/CD integration for LangGraph, CrewAI, OpenAI, and Anthropic agents.",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.js"
+    },
+    "./middleware": {
+      "types": "./dist/middleware.d.ts",
+      "import": "./dist/middleware.js",
+      "require": "./dist/middleware.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "keywords": [
+    "evalview",
+    "testing",
+    "ai-agents",
+    "middleware",
+    "llm",
+    "evaluation"
+  ],
+  "author": "EvalView",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hidai25/eval-view.git",
+    "directory": "sdks/node"
+  },
+  "bugs": {
+    "url": "https://github.com/hidai25/eval-view/issues"
+  },
+  "homepage": "https://github.com/hidai25/eval-view/tree/main/sdks/node#readme",
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "peerDependencies": {
+    "next": ">=13.0.0"
+  },
+  "peerDependenciesMeta": {
+    "next": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}

@@ -1,0 +1,605 @@
+"""Integration tests for the new check pipeline (concurrent execution, DriftTracker wiring).
+
+These tests exercise the specific improvements made during the silent-regression
+detection feature work:
+
+- _execute_check_tests returns (diffs, results, drift_tracker, golden_traces) — four-tuple
+- Concurrent gather: one failing test does not cancel the others
+- DriftTracker is populated during execution and passed to _display_check_results
+- Embeddings are requested only when the caller or project explicitly enables them
+"""
+
+import json
+from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+import yaml
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _write_config(base: Path, adapter: str = "http", endpoint: str = "http://example.com") -> Path:
+    config_dir = base / ".evalview"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / "config.yaml"
+    config_path.write_text(yaml.dump({"adapter": adapter, "endpoint": endpoint}))
+    return config_path
+
+
+def _make_fake_trace():
+    from evalview.core.types import ExecutionTrace, ExecutionMetrics
+    return ExecutionTrace(
+        session_id="s1",
+        start_time=datetime.now(),
+        end_time=datetime.now(),
+        steps=[],
+        final_output="The answer is 42.",
+        metrics=ExecutionMetrics(total_cost=0.0, total_latency=100.0),
+    )
+
+
+def _make_fake_result(test_name: str, score: float = 90.0):
+    from evalview.core.types import EvaluationResult
+    result = MagicMock(spec=EvaluationResult)
+    result.test_case = test_name
+    result.score = score
+    result.passed = score >= 70
+    result.forbidden_tool_violations = []
+    result.trace = _make_fake_trace()
+    return result
+
+
+def _write_golden(base: Path, test_name: str, trace=None, score: float = 90.0) -> None:
+    """Write a minimal golden JSON file directly to bypass save_golden() side effects."""
+    from evalview.core.golden import GoldenStore
+
+    golden_dir = base / ".evalview" / "golden"
+    golden_dir.mkdir(parents=True, exist_ok=True)
+
+    trace = trace or _make_fake_trace()
+    store = GoldenStore(base_path=base)
+
+    fake_result = MagicMock()
+    fake_result.test_case = test_name
+    fake_result.score = score
+    fake_result.passed = True
+    fake_result.trace = trace
+    store.save_golden(fake_result)
+
+
+def _write_test_yaml(test_dir: Path, name: str, query: str = "hello") -> None:
+    test_dir.mkdir(parents=True, exist_ok=True)
+    (test_dir / f"{name}.yaml").write_text(
+        yaml.dump({
+            "name": name,
+            "input": {"query": query},
+            "expected": {"tools": []},
+            "thresholds": {"min_score": 0},
+        })
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests for _execute_check_tests return signature
+# ---------------------------------------------------------------------------
+
+class TestExecuteCheckTestsReturnType:
+    """_execute_check_tests must return a 4-tuple: (diffs, results, drift_tracker, golden_traces)."""
+
+    @pytest.fixture
+    def project(self, tmp_path):
+        _write_config(tmp_path)
+        _write_test_yaml(tmp_path / "tests", "my-test")
+        _write_golden(tmp_path, "my-test")
+        return tmp_path
+
+    def test_returns_four_tuple(self, project, monkeypatch):
+        from evalview.commands.shared import _execute_check_tests
+        from evalview.core.config import EvalViewConfig
+        from evalview.core.drift_tracker import DriftTracker
+
+        monkeypatch.chdir(project)
+
+        fake_trace = _make_fake_trace()
+        fake_result = _make_fake_result("my-test")
+        fake_result.trace = fake_trace
+
+        mock_adapter = MagicMock()
+        mock_adapter.execute = AsyncMock(return_value=fake_trace)
+        mock_evaluator = MagicMock()
+        mock_evaluator.evaluate = AsyncMock(return_value=fake_result)
+
+        from evalview.core.loader import TestCaseLoader
+        loader = TestCaseLoader()
+        test_cases = loader.load_from_directory(str(project / "tests"))
+
+        config = EvalViewConfig(adapter="http", endpoint="http://example.com")
+
+        with (
+            patch("evalview.commands.shared._create_adapter", return_value=mock_adapter),
+            patch("evalview.evaluators.evaluator.Evaluator", return_value=mock_evaluator),
+        ):
+            result = _execute_check_tests(test_cases, config, json_output=False)
+
+        assert isinstance(result, tuple)
+        assert len(result) == 4, "Must return (diffs, results, drift_tracker, golden_traces)"
+
+        diffs, results, drift_tracker, golden_traces = result
+        assert isinstance(diffs, list)
+        assert isinstance(results, list)
+        assert isinstance(drift_tracker, DriftTracker)
+        assert isinstance(golden_traces, dict)
+
+    def test_drift_tracker_is_populated(self, project, monkeypatch):
+        """DriftTracker returned from _execute_check_tests must have history for the test."""
+        from evalview.commands.shared import _execute_check_tests
+        from evalview.core.config import EvalViewConfig
+
+        monkeypatch.chdir(project)
+
+        fake_trace = _make_fake_trace()
+        fake_result = _make_fake_result("my-test")
+        fake_result.trace = fake_trace
+
+        mock_adapter = MagicMock()
+        mock_adapter.execute = AsyncMock(return_value=fake_trace)
+        mock_evaluator = MagicMock()
+        mock_evaluator.evaluate = AsyncMock(return_value=fake_result)
+
+        from evalview.core.loader import TestCaseLoader
+        loader = TestCaseLoader()
+        test_cases = loader.load_from_directory(str(project / "tests"))
+
+        config = EvalViewConfig(adapter="http", endpoint="http://example.com")
+
+        with (
+            patch("evalview.commands.shared._create_adapter", return_value=mock_adapter),
+            patch("evalview.evaluators.evaluator.Evaluator", return_value=mock_evaluator),
+        ):
+            _, _, drift_tracker, _ = _execute_check_tests(test_cases, config, json_output=False)
+
+        history = drift_tracker.get_test_history("my-test")
+        assert len(history) == 1, "DriftTracker should have one entry after one check"
+        assert history[0]["score"] == pytest.approx(90.0)
+
+
+# ---------------------------------------------------------------------------
+# Test: one failing test does not cancel others (return_exceptions=True)
+# ---------------------------------------------------------------------------
+
+class TestConcurrentExecution:
+    """Tests that concurrent gather execution handles per-test failures gracefully."""
+
+    @pytest.fixture
+    def multi_test_project(self, tmp_path):
+        _write_config(tmp_path)
+        # Write two test cases
+        for name in ["test-a", "test-b"]:
+            _write_test_yaml(tmp_path / "tests", name)
+            _write_golden(tmp_path, name)
+        return tmp_path
+
+    def test_one_failure_does_not_cancel_others(self, multi_test_project, monkeypatch):
+        """If test-a raises, test-b should still complete and appear in results."""
+        from evalview.commands.shared import _execute_check_tests
+        from evalview.core.config import EvalViewConfig
+
+        monkeypatch.chdir(multi_test_project)
+
+        fake_trace_b = _make_fake_trace()
+        fake_result_b = _make_fake_result("test-b")
+        fake_result_b.trace = fake_trace_b
+
+        call_count = {"n": 0}
+
+        async def _side_effect(query, context):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("Simulated adapter failure for test-a")
+            return fake_trace_b
+
+        mock_adapter = MagicMock()
+        mock_adapter.execute = _side_effect
+        mock_evaluator = MagicMock()
+        mock_evaluator.evaluate = AsyncMock(return_value=fake_result_b)
+
+        from evalview.core.loader import TestCaseLoader
+        loader = TestCaseLoader()
+        test_cases = loader.load_from_directory(str(multi_test_project / "tests"))
+        # Sort for determinism
+        test_cases.sort(key=lambda tc: tc.name)
+
+        config = EvalViewConfig(adapter="http", endpoint="http://example.com")
+
+        with (
+            patch("evalview.commands.shared._create_adapter", return_value=mock_adapter),
+            patch("evalview.evaluators.evaluator.Evaluator", return_value=mock_evaluator),
+        ):
+            diffs, results, _, _ = _execute_check_tests(test_cases, config, json_output=True)
+
+        # test-a failed → no diff for it
+        # test-b succeeded → one diff
+        diff_names = [name for name, _ in diffs]
+        assert "test-b" in diff_names, "test-b should still complete even though test-a failed"
+
+
+class TestSlowAgentWarning:
+    """Slow-agent warning fires once at 50% of timeout, respects --json mode."""
+
+    @pytest.fixture
+    def project(self, tmp_path):
+        _write_config(tmp_path)
+        _write_test_yaml(tmp_path / "tests", "my-test")
+        _write_golden(tmp_path, "my-test")
+        return tmp_path
+
+    def _run(self, project, execute_delay, json_output, timeout):
+        import asyncio as _asyncio
+        from evalview.commands.shared import _execute_check_tests
+        from evalview.core.config import EvalViewConfig
+        from evalview.core.loader import TestCaseLoader
+
+        fake_trace = _make_fake_trace()
+        fake_result = _make_fake_result("my-test")
+        fake_result.trace = fake_trace
+
+        async def _execute(query, context):
+            await _asyncio.sleep(execute_delay)
+            return fake_trace
+
+        mock_adapter = MagicMock()
+        mock_adapter.execute = _execute
+        mock_evaluator = MagicMock()
+        mock_evaluator.evaluate = AsyncMock(return_value=fake_result)
+
+        test_cases = TestCaseLoader().load_from_directory(str(project / "tests"))
+        config = EvalViewConfig(adapter="http", endpoint="http://example.com")
+        mock_console = MagicMock()
+
+        with (
+            patch("evalview.commands.shared._create_adapter", return_value=mock_adapter),
+            patch("evalview.evaluators.evaluator.Evaluator", return_value=mock_evaluator),
+            patch("evalview.commands.shared.console", mock_console),
+        ):
+            _execute_check_tests(test_cases, config, json_output=json_output, timeout=timeout)
+
+        return [
+            str(c.args[0]) for c in mock_console.print.call_args_list
+            if c.args and "Agent is taking a while" in str(c.args[0])
+        ]
+
+    @pytest.mark.parametrize(
+        "execute_delay,json_output,timeout,expected_warnings",
+        [
+            # Slow agent, non-JSON: warning fires exactly once
+            (1.0, False, 0.4, 1),
+            # Slow agent, JSON mode: warning suppressed
+            (1.0, True, 0.4, 0),
+            # Fast agent: completes before the 50% mark, no warning
+            (0.05, False, 2.0, 0),
+        ],
+        ids=["slow-non-json", "slow-json-mode", "fast-no-warning"],
+    )
+    def test_slow_agent_warning_behavior(
+        self, project, monkeypatch, execute_delay, json_output, timeout, expected_warnings
+    ):
+        monkeypatch.chdir(project)
+        warnings = self._run(project, execute_delay, json_output, timeout)
+        assert len(warnings) == expected_warnings
+
+    def test_warning_reports_real_elapsed_and_timeout(self, project, monkeypatch):
+        """Warning message should include a measured elapsed value and the configured timeout."""
+        import re
+
+        monkeypatch.chdir(project)
+        warnings = self._run(project, execute_delay=1.0, json_output=False, timeout=0.4)
+        assert len(warnings) == 1
+
+        match = re.search(r"\(([\d.]+)s elapsed of ([\d.]+)s timeout\)", warnings[0])
+        assert match is not None, f"Unexpected warning format: {warnings[0]}"
+        elapsed = float(match.group(1))
+        reported_timeout = float(match.group(2))
+        # Elapsed should be at least the warn_after point (~0.2s) and well under the timeout.
+        assert 0.1 <= elapsed < 0.4
+        assert reported_timeout == 0.4
+
+
+# ---------------------------------------------------------------------------
+# Test: DriftTracker is reused in _display_check_results (no dual instantiation)
+# ---------------------------------------------------------------------------
+
+class TestDriftTrackerReuse:
+    """_display_check_results must use the passed tracker, not create a new one."""
+
+    def test_display_uses_passed_drift_tracker(self, tmp_path):
+        from evalview.commands.check_display import _display_check_results
+        from evalview.core.diff import TraceDiff, DiffStatus, OutputDiff
+        from evalview.core.drift_tracker import DriftTracker
+
+        # Build a minimal passing diff
+        output_diff = OutputDiff(
+            similarity=1.0,
+            golden_preview="",
+            actual_preview="",
+            diff_lines=[],
+            severity=DiffStatus.PASSED,
+        )
+        diff = TraceDiff(
+            test_name="my-test",
+            has_differences=False,
+            tool_diffs=[],
+            output_diff=output_diff,
+            score_diff=0.0,
+            latency_diff=0.0,
+            overall_severity=DiffStatus.PASSED,
+        )
+
+        diffs = [("my-test", diff)]
+        analysis = {
+            "has_regressions": False,
+            "has_tools_changed": False,
+            "has_output_changed": False,
+            "all_passed": True,
+        }
+
+        # A tracker with known state — if we detect a new instance was created,
+        # it won't have this history.
+        tracker = DriftTracker(base_path=tmp_path)
+        tracker.record_check("my-test", diff)
+
+        state = MagicMock()
+        state.current_streak = 1
+        state.total_checks = 1
+
+        instantiation_calls = []
+        original_DriftTracker = DriftTracker
+
+        class SpyDriftTracker(original_DriftTracker):
+            def __init__(self, *a, **kw):
+                instantiation_calls.append(1)
+                super().__init__(*a, **kw)
+
+        # DriftTracker is imported locally inside _display_check_results, so
+        # patch the class at its definition site (the module it lives in).
+        with patch("evalview.core.drift_tracker.DriftTracker", SpyDriftTracker):
+            _display_check_results(
+                diffs, analysis, state, False, True, drift_tracker=tracker
+            )
+
+        # DriftTracker.__init__ must NOT have been called for detection purposes
+        # (it's only called as a fallback when no tracker is passed)
+        assert len(instantiation_calls) == 0, (
+            "DriftTracker should NOT be re-instantiated when drift_tracker is passed"
+        )
+
+
+class TestCheckJsonScoreTrend:
+    """`check --json` exposes a conservative suite-level score trend."""
+
+    def test_worsening_score_trend_is_machine_readable(self, tmp_path, capsys):
+        from evalview.commands.check_display import _display_check_results
+        from evalview.core.diff import DiffStatus, OutputDiff, TraceDiff
+        from evalview.core.drift_tracker import DriftTracker
+
+        output_diff = OutputDiff(
+            similarity=1.0,
+            golden_preview="",
+            actual_preview="",
+            diff_lines=[],
+            severity=DiffStatus.PASSED,
+        )
+        diff = TraceDiff(
+            test_name="my-test",
+            has_differences=False,
+            tool_diffs=[],
+            output_diff=output_diff,
+            score_diff=0.0,
+            latency_diff=0.0,
+            overall_severity=DiffStatus.PASSED,
+        )
+        tracker = DriftTracker(base_path=tmp_path)
+        for score in (90.0, 85.0, 80.0):
+            tracker.record_check(
+                "my-test",
+                diff,
+                result=SimpleNamespace(
+                    score=score,
+                    anomaly_report=None,
+                    trust_report=None,
+                    coherence_report=None,
+                ),
+            )
+
+        analysis = {
+            "has_regressions": False,
+            "has_tools_changed": False,
+            "has_output_changed": False,
+            "all_passed": True,
+        }
+        _display_check_results(
+            [("my-test", diff)],
+            analysis,
+            MagicMock(),
+            False,
+            True,
+            drift_tracker=tracker,
+        )
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["trend"]["direction"] == "worsening"
+        assert payload["trend"]["significant"] is True
+        assert payload["trend"]["worsening_tests"] == ["my-test"]
+        assert payload["trend"]["tests"]["my-test"] == {
+            "slope": -5.0,
+            "direction": "worsening",
+            "significant": True,
+            "run_count": 3,
+        }
+        assert payload["diffs"][0]["score_trend"] == payload["trend"]["tests"]["my-test"]
+
+    def test_any_worsening_test_wins_suite_direction(self, tmp_path):
+        from evalview.commands.check_display import _build_score_trend_payload
+        from evalview.core.diff import DiffStatus, TraceDiff
+        from evalview.core.drift_tracker import DriftTracker
+
+        tracker = DriftTracker(base_path=tmp_path)
+        diffs = []
+        for name, scores in {
+            "improving": (70.0, 75.0, 80.0),
+            "worsening": (90.0, 85.0, 80.0),
+        }.items():
+            diff = TraceDiff(
+                test_name=name,
+                has_differences=False,
+                tool_diffs=[],
+                output_diff=None,
+                score_diff=0.0,
+                latency_diff=0.0,
+                overall_severity=DiffStatus.PASSED,
+            )
+            diffs.append((name, diff))
+            for score in scores:
+                tracker.record_check(name, diff, result=SimpleNamespace(score=score))
+
+        payload = _build_score_trend_payload(diffs, tracker)
+
+        assert payload is not None
+        assert payload["direction"] == "worsening"
+        assert payload["worsening_tests"] == ["worsening"]
+        assert payload["improving_tests"] == ["improving"]
+
+
+# ---------------------------------------------------------------------------
+# Test embedding consent through the public entry points.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def semantic_project(tmp_path, monkeypatch):
+    from evalview.core.semantic_diff import SemanticDiff
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "unused-test-key")
+    monkeypatch.setenv("EVALVIEW_TELEMETRY_DISABLED", "1")
+    monkeypatch.setenv("CI", "1")
+    config = _write_config(tmp_path)
+    _write_test_yaml(tmp_path / "tests", "my-test")
+    _write_golden(tmp_path, "my-test")
+    trace = _make_fake_trace()
+    monkeypatch.setattr(
+        "evalview.commands.shared._build_adapter_for_tc",
+        lambda *args: SimpleNamespace(execute=AsyncMock(return_value=trace)),
+    )
+    embed = AsyncMock(return_value=[[1.0], [1.0]])
+    monkeypatch.setattr(SemanticDiff, "_embed", embed)
+    return config, embed
+
+
+@pytest.mark.parametrize(
+    "config_setting, flags, expected_calls",
+    [
+        (None, [], 0),
+        (True, [], 1),
+        (False, ["--semantic-diff"], 1),
+        (True, ["--no-semantic-diff"], 0),
+    ],
+)
+def test_cli_embedding_consent(semantic_project, config_setting, flags, expected_calls):
+    from click.testing import CliRunner
+    from evalview.commands.check_cmd import check
+
+    config, embed = semantic_project
+    if config_setting is not None:
+        with config.open("a") as stream:
+            stream.write(yaml.safe_dump({"diff": {"semantic_diff_enabled": config_setting}}))
+    result = CliRunner().invoke(check, ["tests", "--no-judge", "--json", *flags])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["summary"]["total_tests"] == 1
+    assert embed.await_count == expected_calls
+    if expected_calls:
+        assert embed.await_args.args[0] == ["The answer is 42.", "The answer is 42."]
+
+
+@pytest.mark.parametrize("kwargs, expected_calls", [
+    ({}, 1), ({"semantic_diff": False}, 0), ({"quick": True}, 0),
+])
+def test_sdk_embedding_overrides(semantic_project, monkeypatch, kwargs, expected_calls):
+    from evalview.api import gate
+    from evalview.evaluators.evaluator import Evaluator
+
+    config, embed = semantic_project
+    with config.open("a") as stream:
+        stream.write(yaml.safe_dump({"diff": {"semantic_diff_enabled": True}}))
+    evaluator = Evaluator(skip_llm_judge=True)
+    monkeypatch.setattr("evalview.evaluators.evaluator.Evaluator", lambda **options: evaluator)
+    assert gate("tests", **kwargs).passed
+    assert embed.await_count == expected_calls
+
+
+def test_healing_retry_respects_disabled_embeddings(semantic_project, monkeypatch):
+    from click.testing import CliRunner
+    from evalview.commands.check_cmd import check
+
+    config, embed = semantic_project
+    with config.open("a") as stream:
+        stream.write(yaml.safe_dump({"diff": {"semantic_diff_enabled": True}}))
+    trace = _make_fake_trace()
+    adapter = SimpleNamespace(execute=AsyncMock(side_effect=[
+        trace.model_copy(update={"final_output": "The response changed entirely."}), trace,
+    ]))
+    monkeypatch.setattr("evalview.commands.shared._build_adapter_for_tc", lambda *args: adapter)
+    monkeypatch.setattr("evalview.commands.check_cmd._create_adapter", lambda *args, **kwargs: adapter)
+    result = CliRunner().invoke(check, ["tests", "--no-judge", "--no-semantic-diff", "--heal", "--json"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["healing"]["results"][0]["healed"]
+    assert adapter.execute.await_count == 2
+    embed.assert_not_awaited()
+
+
+def test_display_check_results_labels_multi_turn_regressions(capsys):
+    """Console check output should explicitly label failed multi-turn paths."""
+    from evalview.commands.check_display import _display_check_results
+    from evalview.core.diff import DiffStatus, TraceDiff
+
+    diff = TraceDiff(
+        test_name="refund-needs-order-number",
+        overall_severity=DiffStatus.REGRESSION,
+        has_differences=True,
+        score_diff=-20.0,
+        latency_diff=0.0,
+        tool_diffs=[],
+        output_diff=None,
+    )
+
+    analysis = {
+        "all_passed": False,
+        "has_regressions": True,
+        "has_tools_changed": False,
+        "has_output_changed": False,
+        "execution_failures": 0,
+    }
+    state = MagicMock()
+    state.current_streak = 0
+    state.total_checks = 1
+
+    _display_check_results(
+        [("refund-needs-order-number", diff)],
+        analysis,
+        state,
+        False,
+        False,
+        test_metadata={
+            "refund-needs-order-number": {
+                "is_multi_turn": True,
+                "behavior_class": "multi_turn",
+            }
+        },
+    )
+
+    output = capsys.readouterr().out
+    assert "Multi-turn path:" in output
+    assert "multi turn" in output

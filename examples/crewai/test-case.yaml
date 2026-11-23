@@ -1,0 +1,32 @@
+# EvalView Test Case: CrewAI Stock Analysis
+# Tests a multi-agent crew for stock analysis
+
+name: "CrewAI Stock Analysis"
+description: "Test multi-agent collaboration for stock analysis"
+
+# Configure adapter for CrewAI
+adapter: crewai
+endpoint: http://localhost:8000/crew
+
+input:
+  query: "Analyze Apple (AAPL) stock for investment potential"
+  context:
+    ticker: "AAPL"
+    analysis_type: "comprehensive"
+
+expected:
+  tools:
+    - ScrapeWebsiteTool
+    - WebsiteSearchTool
+    - CalculatorTool
+  output:
+    contains:
+      - "Apple"
+      - "AAPL"
+    not_contains:
+      - "error"
+
+thresholds:
+  min_score: 70
+  max_cost: 1.00
+  max_latency: 120000  # 2 minutes - multi-agent can be slow

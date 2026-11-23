@@ -1,0 +1,26 @@
+# Dogfood Test: Does EvalView chat understand golden baselines?
+
+name: "Golden Baseline Knowledge"
+description: "Test that EvalView chat understands regression testing concepts"
+
+input:
+  query: "Run `evalview snapshot --help` now, then explain what a golden baseline is and how it supports regression testing. Do not create a baseline."
+  context:
+    allowed_commands: ["evalview snapshot --help"]
+
+expected:
+  tools:
+    - evalview_cli
+  output:
+    contains:
+      - "golden"
+      - "baseline"
+      - "regression"
+    not_contains:
+      - "I don't know"
+      - "error"
+
+thresholds:
+  min_score: 70
+  max_cost: 0.05
+  max_latency: 180000

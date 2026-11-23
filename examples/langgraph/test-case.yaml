@@ -1,0 +1,29 @@
+# EvalView Test Case: LangGraph Agent with Tavily Search
+# Tests a LangGraph agent that uses Tavily for web search
+
+name: "LangGraph Tavily Search Agent"
+description: "Test LangGraph agent's ability to search and answer questions using Tavily"
+
+# Configure adapter for LangGraph
+adapter: langgraph
+endpoint: http://localhost:2024
+
+input:
+  query: "What is the weather in San Francisco today?"
+  context:
+    max_steps: 5
+
+expected:
+  tools:
+    - tavily_search_results_json
+  output:
+    contains:
+      - "San Francisco"
+    not_contains:
+      - "error"
+      - "failed"
+
+thresholds:
+  min_score: 70
+  max_cost: 0.50
+  max_latency: 30000

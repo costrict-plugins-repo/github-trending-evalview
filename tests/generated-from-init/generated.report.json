@@ -1,0 +1,10 @@
+{
+  "changes_since_last_generation": {
+    "new_signatures": [],
+    "resolved_signatures": [],
+    "new_tools": [],
+    "resolved_gaps": [],
+    "new_gaps": [],
+    "tests_generated_delta": 0
+  }
+}

@@ -1,0 +1,37 @@
+# EvalView Configuration Example
+# Copy this file to config.yaml and customize for your agent:
+#   cp config.example.yaml config.yaml
+
+# Adapter type: http, langgraph, crewai, tapescope, openai-assistants
+adapter: http
+
+# Your agent's API endpoint
+endpoint: http://localhost:3000/api/agent
+
+# Optional: Assistant/Agent ID (for LangGraph graphs, etc.)
+# assistant_id: agent
+
+# Request timeout in seconds
+timeout: 30.0
+
+# Optional: Custom headers
+headers:
+  Content-Type: application/json
+  # Authorization: Bearer your-token-here
+
+# Optional: Model configuration for cost tracking
+# model:
+#   name: gpt-4o-mini
+#   pricing:
+#     input_per_1m: 0.15
+#     output_per_1m: 0.60
+
+# Optional: LLM-as-judge configuration (for output quality evaluation)
+# judge:
+#   provider: openai          # openai, anthropic, gemini, grok, ollama
+#   model: gpt-4o             # Model to use for evaluation
+
+# Optional: CI/CD exit code configuration (for --diff mode)
+# ci:
+#   fail_on: [REGRESSION]                       # Exit 1 on these statuses
+#   warn_on: [TOOLS_CHANGED, OUTPUT_CHANGED]    # Print warning but exit 0

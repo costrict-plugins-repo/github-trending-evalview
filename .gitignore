@@ -1,0 +1,96 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# EvalView specific
+.agenteval/
+.evalview/state.json
+.evalview/results/
+.evalview/reports/
+.evalview/config.yaml
+.evalview/golden/
+.evalview/.snapshot-reset/
+.evalview/history.jsonl
+# Generated artifacts that should not be tracked
+.evalview/*.html
+.evalview/badge.json
+.evalview/healing/
+# Top-level generated reports (from `evalview report`, `visualize`, `compare`)
+/report.html
+/diff-report.html
+/benchmark_compare.html
+# Leftover from examples/goosebench/tasks/06-create-file.yaml
+/goosebench-test.txt
+tests/test-cases/*.yaml
+!tests/test-cases/example.yaml
+
+# Temp / scratch
+tmp/
+code-review.md
+
+# Local tool histories — per-developer state, not shared
+.aider*
+tests.yaml
+marketing/
+
+# Heavy media — host via release artifacts or a separate assets repo,
+# not in the main library clone. Light .gif previews stay tracked.
+assets/*.mp4
+assets/*.mov
+
+# Private cloud-side spec — kept locally, not published to OSS readers.
+# The real implementation lives in the separate evalview-cloud repo.
+docs/AUTOPR_CLOUD_INTEGRATION.md
+
+# Registry tokens
+.mcpregistry_*
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+**/.DS_Store
+Thumbs.db
+
+# Claude Code
+CLAUDE.md
+.claude/

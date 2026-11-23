@@ -1,0 +1,201 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "evalview"
+version = "0.9.3"
+description = "Open-source testing and regression detection framework for AI agents. Golden baseline diffing, CI/CD integration, works with LangGraph, CrewAI, OpenAI, Anthropic Claude, HuggingFace, Ollama, and MCP."
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{name = "EvalView Team", email = "hidai@evalview.com"}]
+requires-python = ">=3.9"
+keywords = [
+    "ai", "agents", "testing", "evaluation", "llm", "langchain", "langgraph", "crewai", "openai",
+    "anthropic", "claude", "huggingface", "ollama", "mcp",
+    "multi-agent", "pytest-ai", "ai-agent-testing", "llm-testing", "agent-evaluation",
+    "regression-testing", "golden-baseline", "ci-cd-testing", "yaml-testing", "tool-calling",
+    "agent-regression", "llm-regression", "skill-testing", "mcp-contract-testing",
+    "pass-at-k", "non-deterministic-testing", "ai-ci-cd"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "click>=8.1.0",
+    "pydantic>=2.5.0",
+    "pyyaml>=6.0",
+    # >=1.101.0 for the Responses `conversation` param and Conversations
+    # API, which replaced the Assistants API (removed 2026-08-26).
+    "openai>=1.101.0",
+    "anthropic>=0.39.0",
+    "rich>=13.7.0",
+    "prompt_toolkit>=3.0.0",
+    "posthog>=6.9.3,<8",
+    "httpx>=0.26.0",
+    "python-dateutil>=2.8.2",
+    "python-dotenv>=1.0.0",
+    "jinja2>=3.0",
+    "jsonschema>=4.0.0",
+    "llm-prices>=1.4.0",
+    # tomllib is stdlib on 3.11+; pull tomli for 3.9/3.10 to back the
+    # TOML test-case loader (#143).
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+# Interactive charts on top of the built-in HTML report
+reports = [
+    "plotly>=5.0",
+]
+# Watch mode for development
+watch = [
+    "watchdog>=3.0",
+]
+# Cron schedule support for monitor mode
+schedule = [
+    "croniter>=2.0",
+]
+# Backwards-compatible extra; telemetry is included in the base installation.
+telemetry = []
+# Cohere adapter
+cohere = [
+    "cohere>=5.0.0",
+]
+# Mistral adapter
+mistral = [
+    "mistralai>=1.0.0",
+]
+# Pydantic AI adapter (native in-process integration). Pydantic AI itself
+# requires Python 3.10+, so this extra is unavailable on 3.9.
+pydantic-ai = [
+    "pydantic-ai-slim>=0.0.30; python_version >= '3.10'",
+]
+# All optional features
+all = [
+    "plotly>=5.0",
+    "watchdog>=3.0",
+    "croniter>=2.0",
+    "cohere>=5.0.0",
+    "mistralai>=1.0.0",
+    "pydantic-ai-slim>=0.0.30; python_version >= '3.10'",
+]
+# Development dependencies
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.1.0",
+    "readme-renderer[md]",
+    "black==24.10.0",
+    "mypy>=1.7.0",
+    "types-PyYAML>=6.0",
+    "ruff>=0.1.0",
+    "jinja2>=3.0",
+    "plotly>=5.0",
+    "watchdog>=3.0",
+    "anthropic>=0.39.0",
+    # For mock agent in dogfood tests
+    "fastapi>=0.109.0",
+    "uvicorn>=0.27.0",
+    # Pydantic AI adapter tests (requires Python 3.10+; skipped via
+    # pytest.importorskip on 3.9).
+    "pydantic-ai-slim>=0.0.30; python_version >= '3.10'",
+]
+
+[project.scripts]
+evalview = "evalview.cli:main"
+
+[project.entry-points."pytest11"]
+evalview = "evalview.pytest_plugin"
+
+[project.urls]
+Homepage = "https://evalview.com"
+Documentation = "https://github.com/hidai25/eval-view#readme"
+Repository = "https://github.com/hidai25/eval-view.git"
+"Issue Tracker" = "https://github.com/hidai25/eval-view/issues"
+Changelog = "https://github.com/hidai25/eval-view/blob/main/CHANGELOG.md"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["evalview*"]
+
+# Non-Python files that must ship inside the installed package.
+# The canary YAMLs are loaded at runtime by `evalview model-check` and
+# break the command if they are missing from a wheel build.
+[tool.setuptools.package-data]
+# PEP 561 marker — without it, mypy/pyright treat installed evalview as untyped.
+"evalview" = ["py.typed"]
+"evalview.benchmarks.canary" = ["*.yaml", "*.md"]
+"evalview.templates.patterns" = ["*.yaml"]
+
+[tool.black]
+line-length = 100
+target-version = ['py39']
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = false
+warn_unused_configs = true
+ignore_missing_imports = true
+disallow_untyped_defs = false
+check_untyped_defs = true
+
+# Exclude CLI which has many click decorators that are hard to type
+[[tool.mypy.overrides]]
+module = "evalview.cli"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "evalview.commands.run.*"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "evalview.tracking.*"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "evalview.recorder"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "evalview.core.loader"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "evalview.telemetry.*"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "yaml"
+ignore_missing_imports = true
+
+# pytest_plugin imports pytest internals whose stubs use match statements
+# (Python 3.10+), which mypy rejects under python_version = "3.9".
+[[tool.mypy.overrides]]
+module = "evalview.pytest_plugin"
+ignore_errors = true
+
+# _pytest internals use match statements (Python 3.10+). mypy can't parse
+# them under python_version = "3.9" — skip following imports into them entirely.
+[[tool.mypy.overrides]]
+module = "_pytest.*"
+follow_imports = "skip"
+
+# pydantic_ai (an optional dependency requiring Python 3.10+) uses match
+# statements internally, which mypy can't parse under python_version = "3.9".
+[[tool.mypy.overrides]]
+module = "pydantic_ai.*"
+follow_imports = "skip"

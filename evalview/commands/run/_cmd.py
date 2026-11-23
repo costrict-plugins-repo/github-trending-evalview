@@ -1,0 +1,837 @@
+"""Run command — execute test cases against the agent with full evaluation.
+
+This module is a thin orchestrator. Each phase of the run is delegated to a
+focused sub-module:
+
+  _adapters.py   — adapter factory (build_adapter / get_test_adapter)
+  _executor.py   — single-test execution (multi-turn, statistical, retry, debug)
+  _runner.py     — sequential and parallel test runners with live display
+  _reporter.py   — diffs, summaries, HTML reports, exit codes
+  _helpers.py    — phase helpers (load/filter test cases, MCP contract check, watch mode)
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import click
+import yaml
+
+from evalview.commands.shared import console
+from evalview.commands.run._helpers import (
+    _apply_quality_filter,
+    _check_mcp_contracts,
+    _filter_by_name,
+    _filter_by_tags,
+    _load_test_cases,
+    _maybe_show_adapter_menu,
+    _print_run_mode_guidance,
+    _run_watch_mode,
+)
+from evalview.core.llm_provider import get_or_select_provider, save_provider_preference
+from evalview.evaluators.evaluator import Evaluator
+from evalview.skills.ui_utils import print_evalview_banner
+from evalview.telemetry.decorators import track_command, track_run_command
+
+logger = logging.getLogger(__name__)
+
+
+# ── No-agent guide ─────────────────────────────────────────────────────────────
+
+
+def _display_no_agent_guide(endpoint: Optional[str] = None) -> None:
+    """Minimal prompt shown when no agent is reachable."""
+    console.print()
+    if endpoint:
+        console.print(f"  [yellow]No agent at[/yellow] [bold]{endpoint}[/bold] [yellow]— is it running?[/yellow]")
+        console.print()
+        console.print("  Start your agent server, then re-run [cyan]evalview run[/cyan].")
+        console.print("  [dim]If you recently switched agents, run [cyan]evalview init[/cyan] to refresh .evalview/config.yaml.[/dim]")
+    else:
+        console.print("  [yellow]No agent configured.[/yellow]")
+        console.print()
+        console.print("  Point EvalView at your agent in [cyan].evalview/config.yaml[/cyan]:")
+        console.print()
+        console.print("    [dim]adapter: http[/dim]")
+        console.print("    [dim]endpoint: http://localhost:8080/execute[/dim]")
+    console.print()
+    console.print("  [dim]Need a working path?[/dim]")
+    console.print("  [dim]Connect your current agent: evalview init[/dim]")
+    console.print("  [dim]Use isolated onboarding tests: evalview snapshot tests/generated-from-init[/dim]")
+    console.print()
+    console.print("  Or see EvalView catch a real regression right now:")
+    console.print("  [bold cyan]→ evalview demo[/bold cyan]   [dim](no setup, 30 seconds)[/dim]")
+    console.print()
+
+
+# ── Click command ──────────────────────────────────────────────────────────────
+
+
+@click.command("run")
+@click.argument("path", required=False, default=None)
+@click.option("--pattern", default="*.yaml", help="Test case file pattern (default: *.yaml)")
+@click.option("--test", "-t", multiple=True, help="Specific test name(s) to run (can specify multiple: -t test1 -t test2)")
+@click.option("--tag", "tags", multiple=True, help="Run only tests tagged with this behavior (repeatable).")
+@click.option("--filter", "-f", help="Filter tests by name pattern (e.g., 'LangGraph*', '*simple*')")
+@click.option("--output", default=".evalview/results", help="Output directory for results")
+@click.option("--verbose/--no-verbose", default=True, help="Verbose output with full test details (default: enabled)")
+@click.option("--track", is_flag=True, help="Track results for regression analysis")
+@click.option("--compare-baseline", is_flag=True, help="Compare results against baseline and show regressions")
+@click.option("--debug", is_flag=True, help="Show detailed debug info: raw API response, parsed trace, type conversions")
+@click.option("--sequential", is_flag=True, help="Run tests sequentially instead of in parallel (default: parallel)")
+@click.option("--max-workers", default=8, type=int, help="Maximum parallel test executions (default: 8)")
+@click.option("--max-retries", default=0, type=int, help="Maximum retries for flaky tests (default: 0 = no retries)")
+@click.option("--retry-delay", default=1.0, type=float, help="Base delay between retries in seconds (default: 1.0)")
+@click.option("--watch", is_flag=True, help="Watch test files and re-run on changes")
+@click.option("--html-report", type=click.Path(), help="Generate HTML report to specified path")
+@click.option("--summary", is_flag=True, help="Compact output with deltas vs last run and regression detection. Great for CI/CD and sharing.")
+@click.option("--coverage", is_flag=True, help="Show behavior coverage report: tasks tested, tools exercised, paths covered, eval dimensions.")
+@click.option("--judge-model", type=str, help="Model for LLM-as-judge (e.g., gpt-5, sonnet, llama-70b, gpt-4o). Aliases auto-resolve to full names.")
+@click.option(
+    "--judge-provider",
+    type=click.Choice(["openai", "anthropic", "huggingface", "gemini", "grok", "ollama"]),
+    help="Provider for LLM-as-judge evaluation (ollama = free local)",
+)
+@click.option(
+    "--adapter",
+    type=click.Choice(["http", "langgraph", "crewai", "anthropic", "openai-assistants", "tapescope", "huggingface", "goose", "ollama", "mcp", "cohere", "mistral", "opencode"]),
+    help="Override adapter type (e.g., goose, langgraph, mcp). Overrides config file.",
+)
+@click.option("--diff", is_flag=True, help="Compare against golden baselines. Shows REGRESSION/TOOLS_CHANGED/OUTPUT_CHANGED/PASSED status.")
+@click.option("--diff-report", type=click.Path(), help="Generate HTML diff report to specified path (requires --diff)")
+@click.option("--fail-on", type=str, default=None, help="Comma-separated statuses that cause exit code 1: REGRESSION, TOOLS_CHANGED, OUTPUT_CHANGED, CONTRACT_DRIFT (default: REGRESSION)")
+@click.option("--warn-on", type=str, default=None, help="Comma-separated diff statuses that print warning but exit 0 (default: TOOLS_CHANGED,OUTPUT_CHANGED, or from ci.warn_on in config.yaml)")
+@click.option("--strict", is_flag=True, help="Strict mode: fail on any non-PASSED status (equivalent to --fail-on REGRESSION,TOOLS_CHANGED,OUTPUT_CHANGED)")
+@click.option("--trace", is_flag=True, help="Show live trace output: LLM calls, tool executions, costs, and latency.")
+@click.option("--trace-out", type=click.Path(), help="Export trace to JSONL file for debugging or sharing.")
+@click.option("--runs", type=int, default=None, help="Run each test N times for statistical evaluation (enables pass@k metrics). Overrides per-test variance config.")
+@click.option("--pass-rate", type=float, default=0.8, help="Required pass rate for statistical mode (0.0-1.0, default: 0.8). Only used with --runs.")
+@click.option("--difficulty", type=click.Choice(["trivial", "easy", "medium", "hard", "expert"]), default=None, help="Filter tests by difficulty level.")
+@click.option("--contracts", is_flag=True, help="Check MCP contracts for interface drift before running tests. Fails fast if external servers changed.")
+@click.option("--save-golden", is_flag=True, default=False, help="Save results as golden baseline if all tests pass.")
+@click.option("--no-judge", is_flag=True, default=False, help="Skip LLM-as-judge evaluation. Uses deterministic scoring only (string matching + tool assertions). Scores capped at 75. No API key required.")
+@click.option("--judge-cache/--no-judge-cache", default=True, help="Cache LLM judge responses (enabled by default). Use --no-judge-cache to disable.")
+@click.option("--no-open", is_flag=True, default=False, help="Do not auto-open the HTML report in the browser after the run. Implied when CI=true.")
+@click.option("--budget", type=float, default=None, help="Maximum total budget in dollars. Stops execution if exceeded.")
+@click.option("--timeout", "timeout_override", type=float, default=None, help="Override adapter timeout in seconds (e.g. --timeout 120). Overrides config file setting.")
+@click.option("--dry-run", "dry_run", is_flag=True, default=False, help="Preview test plan and estimate cost without executing. No API calls made.")
+@track_command("run", lambda **kw: {"adapter": kw.get("adapter") or "auto", "has_path": bool(kw.get("path"))})
+def run(
+    path: Optional[str],
+    pattern: str,
+    test: tuple,
+    tags: tuple,
+    filter: str,
+    output: str,
+    verbose: bool,
+    track: bool,
+    compare_baseline: bool,
+    debug: bool,
+    sequential: bool,
+    max_workers: int,
+    max_retries: int,
+    retry_delay: float,
+    watch: bool,
+    html_report: str,
+    summary: bool,
+    coverage: bool,
+    judge_model: Optional[str],
+    judge_provider: Optional[str],
+    adapter: Optional[str],
+    diff: bool,
+    diff_report: Optional[str],
+    fail_on: Optional[str],
+    warn_on: Optional[str],
+    strict: bool,
+    trace: bool,
+    trace_out: Optional[str],
+    runs: Optional[int],
+    pass_rate: float,
+    difficulty: Optional[str],
+    contracts: bool,
+    save_golden: bool,
+    no_judge: bool,
+    judge_cache: bool,
+    no_open: bool,
+    budget: Optional[float],
+    timeout_override: Optional[float],
+    dry_run: bool,
+) -> None:
+    """Run test cases against the agent.
+
+    PATH can be a directory containing test cases (e.g., examples/anthropic)
+    or a specific test file (e.g., examples/anthropic/test-case.yaml).
+    """
+    if judge_provider:
+        os.environ["EVAL_PROVIDER"] = judge_provider
+    from evalview.commands.shared import apply_judge_model
+    apply_judge_model(judge_model, interactive=not no_judge)
+
+    if budget is not None and budget <= 0:
+        click.echo("Error: --budget must be a positive number.", err=True)
+        raise SystemExit(1)
+
+    if strict:
+        fail_on = "REGRESSION,TOOLS_CHANGED,OUTPUT_CHANGED,CONTRACT_DRIFT"
+        warn_on = ""
+
+    asyncio.run(_run_async(
+        path=path, pattern=pattern, test=test, filter=filter, output=output,
+        tags=tags,
+        verbose=verbose, track=track, compare_baseline=compare_baseline, debug=debug,
+        sequential=sequential, max_workers=max_workers, max_retries=max_retries,
+        retry_delay=retry_delay, watch=watch, html_report=html_report,
+        summary=summary, coverage=coverage, adapter_override=adapter,
+        diff=diff, diff_report=diff_report, fail_on=fail_on, warn_on=warn_on,
+        trace=trace, trace_out=trace_out, runs=runs, pass_rate=pass_rate,
+        difficulty_filter=difficulty, contracts=contracts, save_golden=save_golden,
+        no_judge=no_judge, judge_cache=judge_cache, no_open=no_open,
+        budget=budget, timeout_override=timeout_override, dry_run=dry_run,
+    ))
+
+
+# ── Async orchestrator ─────────────────────────────────────────────────────────
+
+
+async def _run_async(
+    path: Optional[str],
+    pattern: str,
+    test: tuple,
+    tags: tuple,
+    filter: str,
+    output: str,
+    verbose: bool,
+    track: bool,
+    compare_baseline: bool,
+    debug: bool = False,
+    sequential: bool = False,
+    max_workers: int = 8,
+    max_retries: int = 0,
+    retry_delay: float = 1.0,
+    watch: bool = False,
+    html_report: Optional[str] = None,
+    summary: bool = False,
+    coverage: bool = False,
+    adapter_override: Optional[str] = None,
+    diff: bool = False,
+    diff_report: Optional[str] = None,
+    fail_on: Optional[str] = None,
+    warn_on: Optional[str] = None,
+    trace: bool = False,
+    trace_out: Optional[str] = None,
+    runs: Optional[int] = None,
+    pass_rate: float = 0.8,
+    difficulty_filter: Optional[str] = None,
+    contracts: bool = False,
+    save_golden: bool = False,
+    no_judge: bool = False,
+    judge_cache: bool = True,
+    no_open: bool = False,
+    budget: Optional[float] = None,
+    timeout_override: Optional[float] = None,
+    dry_run: bool = False,
+) -> None:
+    """Async implementation of the run command."""
+    import time as _time
+    _run_start = _time.monotonic()
+    import fnmatch
+    from dotenv import load_dotenv
+    from evalview.tracking import RegressionTracker
+    from evalview.core.retry import RetryConfig
+    from evalview.core.config import ScoringWeights
+    from evalview.evaluators.statistical_evaluator import StatisticalEvaluator
+    from evalview.reporters.console_reporter import ConsoleReporter
+    from evalview.reporters.trace_live_reporter import create_trace_reporter
+    from evalview.commands.run._adapters import build_adapter
+    from evalview.commands.run._executor import ExecutorOptions, execute_single_test
+    from evalview.commands.run._runner import run_sequential, run_parallel
+    from evalview.commands.run._reporter import (
+        collect_diffs, display_diff_results, display_regression_analysis,
+        save_results, save_golden_if_requested, display_html_reports,
+        compute_exit_code, display_trust_frame,
+    )
+
+    # ── Environment ──────────────────────────────────────────────────────────
+    if path:
+        target_dir = Path(path) if Path(path).is_dir() else Path(path).parent
+        path_env = target_dir / ".env.local"
+        if path_env.exists():
+            load_dotenv(dotenv_path=str(path_env), override=True)
+
+    # ── Early config (needed before provider selection) ───────────────────────
+    config_path = Path(".evalview/config.yaml")
+    if path:
+        target_dir = Path(path) if Path(path).is_dir() else Path(path).parent
+        path_config = target_dir / ".evalview" / "config.yaml"
+        if path_config.exists():
+            config_path = path_config
+
+    early_config: Dict[str, Any] = {}
+    if config_path.exists():
+        with open(config_path) as f:
+            early_config = yaml.safe_load(f) or {}
+
+    print_evalview_banner(console, subtitle="[dim]Catch agent regressions before you ship[/dim]")
+
+    # ── Connectivity check ────────────────────────────────────────────────────
+    ec_adapter = (adapter_override or early_config.get("adapter", "http")).lower()
+    no_http_adapters = {"openai-assistants", "anthropic", "ollama", "goose", "cohere", "mistral", "opencode", "langgraph"}
+    ec_endpoint = early_config.get("endpoint") if ec_adapter not in no_http_adapters else None
+
+    # Skip connectivity check when all test files in the path use non-HTTP adapters
+    if ec_endpoint and path:
+        try:
+            _p = Path(path)
+            _yamls = list(_p.glob("*.yaml")) if _p.is_dir() else [_p] if _p.suffix == ".yaml" else []
+            if _yamls and all(
+                (yaml.safe_load(f.read_text()) or {}).get("adapter", "http") in no_http_adapters
+                for f in _yamls
+            ):
+                ec_endpoint = None
+        except Exception:
+            pass
+
+    if ec_endpoint and ec_adapter not in no_http_adapters:
+        import socket as _socket
+        from urllib.parse import urlparse as _urlparse
+        try:
+            parsed = _urlparse(ec_endpoint)
+            sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            sock.settimeout(1.5)
+            ok = sock.connect_ex((parsed.hostname or "localhost", parsed.port or 80)) == 0
+            sock.close()
+            if not ok:
+                _display_no_agent_guide(ec_endpoint)
+                return
+        except Exception:
+            _display_no_agent_guide(ec_endpoint)
+            return
+    elif not ec_endpoint and not early_config and ec_adapter not in no_http_adapters:
+        _display_no_agent_guide(None)
+        return
+
+    # ── Judge / provider setup ────────────────────────────────────────────────
+    judge_cfg_raw = early_config.get("judge", {})
+    if judge_cfg_raw:
+        from evalview.core.config import JudgeConfig, apply_judge_config, EvalViewConfig
+        _jc = JudgeConfig(
+            provider=judge_cfg_raw.get("provider"),
+            model=judge_cfg_raw.get("model"),
+        )
+        # Build a minimal EvalViewConfig just to pass to apply_judge_config
+        _tmp_cfg = EvalViewConfig(
+            adapter=early_config.get("adapter", "http"),
+            endpoint=early_config.get("endpoint", ""),
+            judge=_jc,
+        )
+        apply_judge_config(_tmp_cfg)
+
+    if no_judge:
+        console.print(
+            "[yellow]⚠  --no-judge: skipping LLM-as-judge. Using deterministic scoring only "
+            "(scores capped at 75).[/yellow]\n"
+        )
+    else:
+        result = get_or_select_provider(console)
+        if result is None:
+            try:
+                from evalview.telemetry.client import get_client as _tc
+                from evalview.telemetry.events import CommandEvent as _CE
+                _tc().track(_CE(
+                    command_name="run_failed_early",
+                    success=False,
+                    properties={"failure_reason": "no_provider_configured", "has_config": bool(early_config)},
+                ))
+            except Exception:
+                pass
+            return
+
+        selected_provider, selected_api_key = result
+
+        from evalview.core.llm_provider import LLMProvider, PROVIDER_CONFIGS as _PROVIDER_CONFIGS
+        if selected_provider != LLMProvider.OLLAMA:
+            try:
+                import anthropic as _anthropic
+                import openai as _openai
+
+                if selected_provider == LLMProvider.ANTHROPIC:
+                    _anthropic.Anthropic(api_key=selected_api_key).models.list()
+                elif selected_provider == LLMProvider.OPENAI:
+                    _openai.OpenAI(api_key=selected_api_key).models.list()
+            except Exception as probe_exc:
+                probe_str = str(probe_exc).lower()
+                is_auth = any(
+                    kw in probe_str
+                    for kw in ("authentication", "401", "invalid", "unauthorized", "api key")
+                )
+                if is_auth:
+                    cfg = _PROVIDER_CONFIGS[selected_provider]
+                    console.print("\n[bold red]✗ LLM judge authentication failed[/bold red]")
+                    console.print(f"  Provider: [bold]{cfg.display_name}[/bold]")
+                    console.print(f"  Error:    {str(probe_exc)[:120]}")
+                    console.print()
+                    console.print("  Fix one of the following:")
+                    console.print(f"    1. Set a valid key:   [cyan]export {cfg.env_var}='sk-...'[/cyan]")
+                    console.print("    2. Switch provider:   [cyan]evalview run --judge-provider openai[/cyan]")
+                    console.print("    3. Skip LLM judge:    [cyan]evalview run --no-judge[/cyan]")
+                    console.print()
+                    return
+                raise
+
+        save_provider_preference(selected_provider)
+        if not os.environ.get("EVAL_PROVIDER"):
+            os.environ["EVAL_PROVIDER"] = selected_provider.value
+        if selected_provider != LLMProvider.OLLAMA:
+            provider_cfg = _PROVIDER_CONFIGS[selected_provider]
+            os.environ[provider_cfg.env_var] = selected_api_key
+
+    # ── Mode announcements ────────────────────────────────────────────────────
+    if debug:
+        console.print("[dim]🐛 Debug mode enabled - will show raw responses[/dim]\n")
+        verbose = True
+
+    if verbose:
+        console.print("[dim]🔍 Verbose mode enabled[/dim]\n")
+
+    if track or compare_baseline:
+        console.print("[dim]📊 Regression tracking enabled[/dim]\n")
+
+    if sequential:
+        console.print("[dim]⏳ Running tests sequentially[/dim]\n")
+    else:
+        console.print(f"[dim]⚡ Running tests in parallel (max {max_workers} workers)[/dim]\n")
+
+    if max_retries > 0:
+        console.print(f"[dim]🔄 Retry enabled: up to {max_retries} retries with {retry_delay}s base delay[/dim]\n")
+
+    # ── Trace reporter ────────────────────────────────────────────────────────
+    trace_reporter = None
+    if trace or trace_out:
+        trace_reporter = create_trace_reporter(console=console, trace_out_path=trace_out)
+        if trace:
+            console.print("[dim]📡 Trace mode enabled - showing live execution details[/dim]\n")
+        if trace_out:
+            console.print(f"[dim]📄 Trace output: {trace_out}[/dim]\n")
+
+    # ── Watch mode availability ───────────────────────────────────────────────
+    if watch:
+        try:
+            from evalview.core.watcher import WATCHDOG_AVAILABLE
+            if not WATCHDOG_AVAILABLE:
+                console.print("[yellow]⚠️  Watch mode requires watchdog. Install with: pip install watchdog[/yellow]")
+                console.print("[dim]Falling back to single run mode...[/dim]\n")
+                watch = False
+            else:
+                console.print("[dim]👀 Watch mode enabled - press Ctrl+C to stop[/dim]\n")
+        except ImportError:
+            console.print("[yellow]⚠️  Watch mode requires watchdog. Install with: pip install watchdog[/yellow]")
+            watch = False
+
+    # ── Full config loading ───────────────────────────────────────────────────
+    config_path_final: Optional[Path] = None
+    if path:
+        target_dir = Path(path) if Path(path).is_dir() else Path(path).parent
+        path_config = target_dir / ".evalview" / "config.yaml"
+        if path_config.exists():
+            config_path_final = path_config
+            if verbose:
+                console.print(f"[dim]📂 Using config from: {path_config}[/dim]")
+
+    if config_path_final is None:
+        config_path_final = Path(".evalview/config.yaml")
+
+    config: Dict[str, Any] = {}
+    if config_path_final.exists():
+        with open(config_path_final) as f:
+            config = yaml.safe_load(f) or {}
+    elif verbose:
+        console.print("[dim]No config file found - will use test case adapter/endpoint if available[/dim]")
+
+    if timeout_override is not None:
+        config["timeout"] = timeout_override
+
+    run_endpoint = config.get("endpoint", "")
+    run_adapter_type = config.get("adapter", "http")
+    if run_endpoint:
+        console.print(f"[blue]Running test cases...[/blue]  [dim]→ {run_adapter_type}  {run_endpoint}[/dim]\n")
+    else:
+        console.print("[blue]Running test cases...[/blue]\n")
+
+    # Apply CI config from config.yaml (CLI flags take precedence)
+    ci_cfg = config.get("ci", {})
+    if fail_on is None:
+        raw = ci_cfg.get("fail_on", ["REGRESSION"])
+        fail_on = ",".join(raw) if isinstance(raw, list) else str(raw)
+    if warn_on is None:
+        raw = ci_cfg.get("warn_on", ["TOOLS_CHANGED", "OUTPUT_CHANGED"])
+        warn_on = ",".join(raw) if isinstance(raw, list) else str(raw)
+
+    # ── MCP contract check ────────────────────────────────────────────────────
+    contract_drifts: List[Any] = []
+    if contracts:
+        contract_drifts = await _check_mcp_contracts(fail_on, console)
+        if contract_drifts and "CONTRACT_DRIFT" in (fail_on or "").upper():
+            console.print("[bold red]Aborting: MCP contract drift detected. Fix contracts before running tests.[/bold red]")
+            console.print("[dim]Accept changes: evalview mcp snapshot <endpoint> --name <name>[/dim]\n")
+            raise SystemExit(1)
+
+    # ── Model / SSRF / judge config ───────────────────────────────────────────
+    model_config = config.get("model", {})
+    if model_config:
+        if isinstance(model_config, str):
+            console.print(f"[dim]🧠 Agent model: {model_config}[/dim]")
+        elif isinstance(model_config, dict):
+            console.print(f"[dim]🧠 Agent model: {model_config.get('name', 'unknown')}[/dim]")
+            if "pricing" in model_config:
+                console.print(
+                    f"[dim]💵 Custom pricing: ${model_config['pricing']['input_per_1m']:.2f} in, "
+                    f"${model_config['pricing']['output_per_1m']:.2f} out[/dim]"
+                )
+
+    allow_private_urls = config.get("allow_private_urls", True)
+    if verbose:
+        lock = "🔓" if allow_private_urls else "🔒"
+        label = "allowing private URLs (local dev mode)" if allow_private_urls else "blocking private URLs"
+        console.print(f"[dim]{lock} SSRF protection: {label}[/dim]")
+
+    # Judge config from YAML overrides .env.local
+    judge_yaml_cfg = config.get("judge", {})
+    if judge_yaml_cfg:
+        if judge_yaml_cfg.get("provider"):
+            os.environ["EVAL_PROVIDER"] = judge_yaml_cfg["provider"]
+        if judge_yaml_cfg.get("model"):
+            from evalview.core.llm_provider import resolve_model_alias
+            os.environ["EVAL_MODEL"] = resolve_model_alias(judge_yaml_cfg["model"])
+
+    # Always show which judge model is being used
+    _jmd = os.environ.get("EVAL_MODEL", "")
+    _jpd = os.environ.get("EVAL_PROVIDER", "")
+    if _jmd and not no_judge:
+        _judge_display = f"{_jpd}/{_jmd}" if _jpd else _jmd
+        console.print(f"[dim]⚖️  Judge model: {_judge_display}[/dim]")
+    elif not no_judge:
+        from evalview.core.llm_configs import detect_available_providers as _dap
+        from evalview.core.llm_configs import PROVIDER_CONFIGS as _PC2
+        _avail = _dap()
+        if _avail:
+            _p = _avail[0]
+            console.print(f"[dim]⚖️  Judge model: {_p.provider.value}/{_PC2[_p.provider].default_model} (auto-detected)[/dim]")
+
+    # ── Global adapter ────────────────────────────────────────────────────────
+    adapter_type = adapter_override or config.get("adapter", "http")
+    global_adapter = None
+
+    if adapter_override and verbose:
+        console.print(f"[dim]🔌 Adapter override: {adapter_override}[/dim]")
+
+    has_endpoint = "endpoint" in config
+    is_api_adapter = adapter_type in ("openai-assistants", "anthropic", "ollama", "cohere", "mistral")
+    is_cli_adapter = adapter_type == "goose"
+
+    if has_endpoint or is_api_adapter or is_cli_adapter:
+        if adapter_type == "anthropic" and not os.getenv("ANTHROPIC_API_KEY"):
+            console.print("[red]❌ ANTHROPIC_API_KEY not found in environment.[/red]")
+            console.print("[dim]Set it in your .env.local file or export it:[/dim]")
+            console.print("[dim]  export ANTHROPIC_API_KEY=sk-ant-...[/dim]")
+            return
+
+        global_adapter = build_adapter(adapter_type, None, config, model_config, verbose, allow_private_urls)
+
+        if adapter_type == "goose" and verbose:
+            console.print("[dim]🪿 Using Goose CLI adapter[/dim]")
+
+    # ── Evaluator setup ───────────────────────────────────────────────────────
+    scoring_weights = None
+    if "scoring" in config and "weights" in config["scoring"]:
+        try:
+            scoring_weights = ScoringWeights(**config["scoring"]["weights"])
+            if verbose:
+                w = scoring_weights
+                console.print(
+                    f"[dim]⚖️  Custom weights: tool={w.tool_accuracy}, "
+                    f"output={w.output_quality}, sequence={w.sequence_correctness}[/dim]"
+                )
+        except Exception as exc:
+            console.print(f"[yellow]⚠️  Invalid scoring weights in config: {exc}. Using defaults.[/yellow]")
+
+    _judge_cache = None
+    if judge_cache and not no_judge:
+        from evalview.core.judge_cache import JudgeCache
+        _judge_cache = JudgeCache()
+        if verbose:
+            console.print("[dim]Enabled LLM judge response cache[/dim]")
+
+    evaluator = Evaluator(
+        default_weights=scoring_weights,
+        skip_llm_judge=no_judge,
+        judge_cache=_judge_cache,
+    )
+
+    retry_config = RetryConfig(
+        max_retries=max_retries,
+        base_delay=retry_delay,
+        exponential=True,
+        jitter=True,
+    )
+
+    tracker = None
+    regression_reports: Dict[str, Any] = {}
+    if track or compare_baseline:
+        tracker = RegressionTracker()
+
+    # ── Load test cases ───────────────────────────────────────────────────────
+    test_cases = _load_test_cases(path, pattern, verbose, console)
+    if test_cases is None:
+        return
+
+    # ── Filter: difficulty ────────────────────────────────────────────────────
+    if difficulty_filter:
+        original = len(test_cases)
+        test_cases = [tc for tc in test_cases if tc.difficulty == difficulty_filter]
+        if not test_cases:
+            console.print(f"[yellow]⚠️  No test cases with difficulty '{difficulty_filter}' found[/yellow]")
+            console.print(f"[dim]Original count: {original} tests[/dim]")
+            return
+        if verbose:
+            console.print(f"[dim]🎯 Filtered to {len(test_cases)}/{original} tests with difficulty: {difficulty_filter}[/dim]\n")
+
+    test_cases, active_tags = _filter_by_tags(test_cases, tags)
+    if active_tags and not test_cases:
+        console.print(f"[yellow]⚠️  No test cases matched tags: {', '.join(active_tags)}[/yellow]")
+        return
+    if verbose and active_tags:
+        console.print(f"[dim]🏷️  Filtered to behavior tags: {', '.join(active_tags)}[/dim]\n")
+
+    # ── Filter: quality check ─────────────────────────────────────────────────
+    test_cases = _apply_quality_filter(test_cases, console)
+    if not test_cases:
+        console.print("[yellow]⚠️  No runnable tests. Fix test quality issues above and re-run.[/yellow]")
+        return
+    _print_run_mode_guidance(test_cases, console)
+
+    # ── Variance / statistical mode ───────────────────────────────────────────
+    if runs is not None:
+        if runs < 2:
+            console.print("[red]❌ --runs must be at least 2 for statistical mode[/red]")
+            return
+        if runs > 100:
+            console.print("[red]❌ --runs cannot exceed 100[/red]")
+            return
+
+        from evalview.core.types import VarianceConfig
+        cli_variance = VarianceConfig(runs=runs, pass_rate=pass_rate)
+        for tc in test_cases:
+            tc.thresholds.variance = cli_variance
+        console.print(f"[cyan]📊 Statistical mode: Running each test {runs} times (pass rate: {pass_rate:.0%})[/cyan]\n")
+
+    # ── Interactive adapter menu (multi-adapter projects) ─────────────────────
+    if pattern == "*.yaml" and not test and not filter and sys.stdin.isatty():
+        test_cases, html_report = _maybe_show_adapter_menu(test_cases, config, html_report, console)
+
+    # ── Filter: name / glob ───────────────────────────────────────────────────
+    if test or filter:
+        test_cases = _filter_by_name(test_cases, test, filter, verbose, fnmatch, console)
+        if test_cases is None:
+            return
+
+    console.print(f"Found {len(test_cases)} test case(s)\n")
+
+    # ── Dry-run mode ──────────────────────────────────────────────────────────
+    if dry_run:
+        from rich.table import Table
+        table = Table(title="Dry Run — Test Plan", show_header=True, header_style="bold")
+        table.add_column("Test", style="cyan")
+        table.add_column("Adapter", style="dim")
+        table.add_column("Judge Calls", justify="right")
+
+        total_judge_calls = 0
+        for tc in test_cases:
+            tc_adapter = tc.adapter or adapter_type
+            # Account for statistical mode: each run may trigger a judge call
+            tc_runs = 1
+            if runs:
+                tc_runs = runs
+            elif tc.thresholds and hasattr(tc.thresholds, 'variance') and tc.thresholds.variance:
+                tc_runs = getattr(tc.thresholds.variance, 'runs', 1) or 1
+            judge_calls = 0 if no_judge else tc_runs
+            total_judge_calls += judge_calls
+            table.add_row(tc.name, tc_adapter, str(judge_calls))
+
+        console.print(table)
+        console.print()
+        console.print(f"  Tests:       {len(test_cases)}")
+        console.print(f"  Agent calls: {len(test_cases)}")
+        console.print(f"  Judge calls: {total_judge_calls}")
+        if budget is not None:
+            console.print(f"  Budget:      ${budget:.2f}")
+        console.print()
+        console.print("[dim]No API calls were made. Remove --dry-run to execute.[/dim]\n")
+        return
+
+    # ── Budget cap from config ────────────────────────────────────────────────
+    if budget is None and config.get("budget"):
+        budget = float(config["budget"])
+    if budget is not None:
+        console.print(f"[dim]💰 Budget cap: ${budget:.2f}[/dim]\n")
+
+    # ── Build executor options ────────────────────────────────────────────────
+    statistical_evaluator = StatisticalEvaluator()
+    stats_reporter = ConsoleReporter()
+
+    exec_opts = ExecutorOptions(
+        evaluator=evaluator,
+        retry_config=retry_config,
+        global_adapter=global_adapter,
+        model_config=model_config,
+        allow_private_urls=allow_private_urls,
+        config=config,
+        verbose=verbose,
+        debug=debug,
+        track=track,
+        compare_baseline=compare_baseline,
+        tracker=tracker,
+        regression_reports=regression_reports,
+        trace_reporter=trace_reporter,
+        statistical_evaluator=statistical_evaluator,
+        stats_reporter=stats_reporter,
+        no_judge=no_judge,
+    )
+
+    async def _execute(test_case: Any) -> Any:
+        return await execute_single_test(test_case, exec_opts, console)
+
+    # ── Run tests ─────────────────────────────────────────────────────────────
+    if sequential:
+        results, passed, failed, execution_errors = await run_sequential(test_cases, _execute, console, config)
+    else:
+        results, passed, failed, execution_errors = await run_parallel(
+            test_cases, _execute, max_workers, verbose, console, config
+        )
+
+    # ── Judge cache stats ─────────────────────────────────────────────────────
+    if _judge_cache is not None:
+        cs = _judge_cache.stats()
+        if cs["total"] > 0:
+            console.print(
+                f"  [dim]Judge cache: {cs['hits']} hits / {cs['total']} lookups "
+                f"({cs['hit_rate']:.0%} hit rate)[/dim]"
+            )
+
+    # ── Cost summary ──────────────────────────────────────────────────────────
+    if results:
+        total_cost = sum(r.trace.metrics.total_cost for r in results)
+        total_api_calls = sum(len(r.trace.steps) for r in results)
+        _free_adapters = {"opencode", "goose", "ollama"}
+        all_local = all((r.adapter_name or "").lower() in _free_adapters for r in results)
+        cost_str = "free (local)" if all_local and total_cost == 0.0 else f"${total_cost:.4f}"
+        console.print(
+            f"  [dim]💰 {len(results)} tests, {total_api_calls} tool calls, "
+            f"{cost_str} total[/dim]"
+        )
+        if budget is not None and total_cost > budget:
+            console.print(
+                f"  [red]⚠  Budget exceeded: ${total_cost:.4f} > ${budget:.2f} limit[/red]"
+            )
+            raise SystemExit(1)
+
+    # ── Summary / coverage / regression analysis ──────────────────────────────
+    console.print()
+    reporter = ConsoleReporter()
+    if summary:
+        suite_name = (Path(path).name if Path(path).is_dir() else Path(path).stem) if path else None
+        previous = None
+        output_dir = Path(output)
+        if output_dir.exists():
+            from evalview.reporters.json_reporter import JSONReporter
+            previous = JSONReporter.get_latest_results(output_dir)
+        reporter.print_compact_summary(results, suite_name=suite_name, previous_results=previous)
+    else:
+        reporter.print_summary(results)
+
+    if coverage:
+        suite_name = (Path(path).name if Path(path).is_dir() else Path(path).stem) if path else None
+        reporter.print_coverage_report(test_cases, results, suite_name=suite_name)
+
+    display_regression_analysis(regression_reports, console)
+
+    # ── Save results ──────────────────────────────────────────────────────────
+    results_file = save_results(results, output, console)
+    save_golden_if_requested(save_golden, failed, execution_errors, results, results_file, console)
+
+    # ── Diff display ──────────────────────────────────────────────────────────
+    diffs_found: List[Any] = []
+    if diff and results:
+        diffs_found = collect_diffs(results)
+        display_diff_results(diffs_found, results, console)
+
+    # ── HTML reports ──────────────────────────────────────────────────────────
+    display_html_reports(html_report, diff_report, diff, diffs_found, results, no_open, watch, console)
+
+    # ── Tracking tip ──────────────────────────────────────────────────────────
+    if track:
+        console.print("[dim]📊 Results tracked for regression analysis[/dim]")
+        console.print("[dim]   View trends: evalview trends[/dim]")
+        console.print("[dim]   Set baseline: evalview baseline set[/dim]\n")
+
+    # ── Guided conversion to snapshot workflow ────────────────────────────────
+    if not watch and not diff and results:
+        from evalview.core.golden import GoldenStore
+        from evalview.core.project_state import ProjectStateStore
+        from evalview.core.celebrations import Celebrations
+
+        store = GoldenStore()
+        state_store = ProjectStateStore()
+        if (
+            not store.list_golden()
+            and all(r.passed for r in results)
+            and not state_store.load().conversion_suggestion_shown
+        ):
+            Celebrations.conversion_suggestion(len(results))
+            state_store.mark_conversion_shown()
+
+    # ── Exit code ─────────────────────────────────────────────────────────────
+    exit_code = compute_exit_code(failed, execution_errors, diff, diffs_found, fail_on, warn_on, console)
+
+    # ── Trust-framing summary ─────────────────────────────────────────────────
+    if not watch:
+        display_trust_frame(passed, failed, execution_errors, results, results_file, console)
+
+    # ── Telemetry ─────────────────────────────────────────────────────────────
+    try:
+        track_run_command(
+            adapter_type=adapter_type,
+            test_count=len(test_cases),
+            pass_count=passed,
+            fail_count=failed,
+            duration_ms=(_time.monotonic() - _run_start) * 1000,
+            diff_mode=diff,
+            watch_mode=watch,
+            parallel=not sequential,
+        )
+    except Exception:
+        pass
+
+    # ── Watch mode ────────────────────────────────────────────────────────────
+    if watch:
+        try:
+            await _run_watch_mode(
+                path=path, pattern=pattern, test=test, filter=filter, output=output,
+                verbose=verbose, track=track, compare_baseline=compare_baseline,
+                debug=debug, sequential=sequential, max_workers=max_workers,
+                max_retries=max_retries, retry_delay=retry_delay,
+                html_report=html_report, console=console,
+            )
+        finally:
+            if trace_reporter:
+                trace_reporter.close()
+    else:
+        if trace_reporter:
+            trace_reporter.close()
+        if exit_code != 0:
+            sys.exit(exit_code)
+
+
